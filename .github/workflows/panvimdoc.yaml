@@ -53,6 +53,7 @@ jobs:
         id: cpr
         uses: peter-evans/create-pull-request@v7
         with:
+          token: ${{ secrets.GUSTAV_PAT }}
           branch: bot/regenerate-vimdoc
           delete-branch: true
           title: "chore: regenerate Neovim vimdoc"
@@ -68,5 +69,5 @@ jobs:
       - name: Enable auto-merge
         if: steps.cpr.outputs.pull-request-number
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GUSTAV_PAT }}
         run: gh pr merge --auto --squash "${{ steps.cpr.outputs.pull-request-number }}"
