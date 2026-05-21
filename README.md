@@ -207,6 +207,7 @@ require('fff').setup({
     preview_position = 'right',   -- 'left' | 'right' | 'top' | 'bottom'
     preview_size = 0.5,
     flex = { size = 130, wrap = 'top' },
+    min_list_height = 10, --  do not display anything except the list below this threshold
     show_scrollbar = true,
     path_shorten_strategy = 'middle_number', -- 'middle_number' | 'middle' | 'end' | 'start'
     anchor = 'center',

@@ -90,7 +90,7 @@ describe('picker find_files_in_dir path resolution (issue #389)', function()
   it(':edit opens the file inside base_path even when neovim cwd differs', function()
     assert.are_not.equal(norm(target_dir), norm(vim.fn.getcwd()))
 
-    assert.is_true(picker_ui.change_indexing_directory(target_dir))
+    assert.is_true(require('fff.core').change_indexing_directory(target_dir))
     wait_for_scan(target_dir, 10000)
 
     local items = file_picker.search_files('', nil, nil, nil, nil)

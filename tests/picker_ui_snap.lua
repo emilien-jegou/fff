@@ -90,6 +90,8 @@ local LAYOUTS = {
 
 local T = MiniTest.new_set()
 
+local PROMPT_POSITIONS = { 'bottom', 'top' }
+
 for _, geometry in ipairs(LAYOUTS) do
   local set = MiniTest.new_set({
     hooks = {
@@ -98,31 +100,33 @@ for _, geometry in ipairs(LAYOUTS) do
     },
   })
 
-  set['empty_bottom'] = function()
-    open_picker('bottom')
-    assert_snapshot_match()
-  end
+  -- Run every per-geometry case for both prompt positions: layout math and
+  -- list rendering diverge between top/bottom (see AGENTS.md), so a snapshot
+  -- on a single side would silently miss regressions in the other.
+  for _, prompt in ipairs(PROMPT_POSITIONS) do
+    set['empty_' .. prompt] = function()
+      open_picker(prompt)
+      assert_snapshot_match()
+    end
 
-  set['empty_top'] = function()
-    open_picker('top')
-    assert_snapshot_match()
-  end
+    set['query_main_' .. prompt] = function()
+      open_picker(prompt, 'main')
+      assert_snapshot_match()
+    end
 
-  set['query_main_bottom'] = function()
-    open_picker('bottom', 'main')
-    assert_snapshot_match()
-  end
+    set['no_results_' .. prompt] = function()
+      open_picker(prompt, 'zzzzzzzzz')
+      assert_snapshot_match()
+    end
 
-  set['no_results_bottom'] = function()
-    open_picker('bottom', 'zzzzzzzzz')
-    assert_snapshot_match()
-  end
-
-  set['cursor_second_item'] = function()
-    open_picker('bottom')
-    child.type_keys('<Down>')
-    vim.loop.sleep(200)
-    assert_snapshot_match()
+    set['cursor_second_item_' .. prompt] = function()
+      open_picker(prompt)
+      -- Bottom prompt visually goes up with <Down>; top prompt goes down with <Down>.
+      -- Either way one keypress moves to the second item — what we want to capture.
+      child.type_keys('<Down>')
+      vim.loop.sleep(200)
+      assert_snapshot_match()
+    end
   end
 
   T[geometry.name] = set
@@ -138,11 +142,13 @@ local debug_set = MiniTest.new_set({
   },
 })
 
-debug_set['file_info_panel'] = function()
-  open_picker('bottom', 'main')
-  -- Modified / Last Access timestamps drift between runs; ignore those text
-  -- rows but still verify everything else (panel layout, scores, attrs).
-  assert_snapshot_match({ ignore_text = { 13, 14 } })
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  debug_set['file_info_panel_' .. prompt] = function()
+    open_picker(prompt, 'main')
+    -- Modified / Last Access timestamps drift between runs; ignore those text
+    -- rows but still verify everything else (panel layout, scores, attrs).
+    assert_snapshot_match({ ignore_text = { 13, 14 } })
+  end
 end
 T['debug'] = debug_set
 
@@ -166,19 +172,14 @@ local function train_combo()
   vim.loop.sleep(400)
 end
 
-T['combo']['boost_bottom'] = function()
-  train_combo()
-  open_picker('bottom', 'main')
-  -- Combo overlay float renders asynchronously after render_list.
-  vim.loop.sleep(400)
-  assert_snapshot_match()
-end
-
-T['combo']['boost_top'] = function()
-  train_combo()
-  open_picker('top', 'main')
-  vim.loop.sleep(400)
-  assert_snapshot_match()
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['combo']['boost_' .. prompt] = function()
+    train_combo()
+    open_picker(prompt, 'main')
+    -- Combo overlay float renders asynchronously after render_list.
+    vim.loop.sleep(400)
+    assert_snapshot_match()
+  end
 end
 
 T['scrollbar'] = MiniTest.new_set({
@@ -188,17 +189,22 @@ T['scrollbar'] = MiniTest.new_set({
   },
 })
 
-T['scrollbar']['next_page'] = function()
-  open_picker('bottom')
-  -- Bottom prompt iters in reverse — `<Up>` advances cursor toward higher
-  -- indices (visually up the list). Walking past the last in-page item
-  -- triggers load_next_page; the scrollbar thumb appears at the new offset.
-  for _ = 1, 30 do
-    child.type_keys('<Up>')
-    vim.loop.sleep(20)
+-- Cursor advance key differs by prompt position: bottom prompt iterates the
+-- list in reverse so `<Up>` walks toward higher indices; top prompt is
+-- conventional. Either way we walk past the last in-page item to trigger
+-- load_next_page and surface the scrollbar thumb at the new offset.
+local SCROLL_KEY = { bottom = '<Up>', top = '<Down>' }
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['scrollbar']['next_page_' .. prompt] = function()
+    open_picker(prompt)
+    for _ = 1, 30 do
+      child.type_keys(SCROLL_KEY[prompt])
+      vim.loop.sleep(20)
+    end
+    vim.loop.sleep(400)
+    assert_snapshot_match()
   end
-  vim.loop.sleep(400)
-  assert_snapshot_match()
 end
 
 return T

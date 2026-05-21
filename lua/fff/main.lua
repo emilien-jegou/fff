@@ -209,11 +209,7 @@ end
 --- Change the base directory for the file picker
 --- @param new_path string New directory path to use as base
 --- @return boolean `true` if successful, `false` otherwise
-function M.change_indexing_directory(new_path)
-  local picker_ok, picker_ui = pcall(require, 'fff.picker_ui')
-  if picker_ok then return picker_ui.change_indexing_directory(new_path) end
-  return false
-end
+function M.change_indexing_directory(new_path) return require('fff.core').change_indexing_directory(new_path) end
 
 --- Opens the file under the cursor with an optional callback if the only file
 --- is found and we are about to inline open it

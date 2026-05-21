@@ -10,761 +10,14 @@ local list_separator = require('fff.list_separator')
 local list_renderer = require('fff.list_renderer')
 local scrollbar = require('fff.scrollbar')
 local rust = require('fff.rust')
+local layout = require('fff.layout')
 
---- Base path of picker can change that's why we can not rely on relative
---- path for reading/opening files. This function resolves correct absolute path
---- @param relative_path string|nil
---- @return string|nil
-local function canonicalize_fff_path(relative_path)
-  if not relative_path or relative_path == '' then return nil end
-  local path = relative_path
-  -- Strip Windows long-path prefix (\\?\) — Neovim cannot open these.
-  if vim.startswith(path, '\\\\?\\') then path = path:sub(5) end
-  -- Already absolute: don't re-anchor.
-  if vim.fn.fnamemodify(path, ':p') == path then return path end
-  local base = conf.get().base_path
-  if not base or base == '' then return path end
-  return vim.fs.normalize(base .. '/' .. path)
-end
-
---- @param item table|nil
---- @return string|nil
-local function resolve_item_path(item) return item and canonicalize_fff_path(item.relative_path) or nil end
-
-local BORDER_PRESETS = {
-  single = { '┌', '─', '┐', '│', '┘', '─', '└', '│' },
-  double = { '╔', '═', '╗', '║', '╝', '═', '╚', '║' },
-  rounded = { '╭', '─', '╮', '│', '╯', '─', '╰', '│' },
-  solid = { '▛', '▀', '▜', '▐', '▟', '▄', '▙', '▌' },
-  shadow = { '', '', ' ', ' ', ' ', ' ', ' ', '' },
-  none = { '', '', '', '', '', '', '', '' },
-}
-
-local T_JUNCTION_PRESETS = {
-  single = { '├', '┤', '┬', '┴', '┼' },
-  double = { '╠', '╣', '╦', '╩', '╬' },
-  rounded = { '├', '┤', '┬', '┴', '┼' },
-  solid = { '▌', '▐', '▀', '▄', '█' },
-  shadow = { '', '', '', '', '' },
-  none = { '', '', '', '', '' },
-}
-
---- Get border characters from vim.o.winborder for custom connected borders
---- @return table Array of 8 border characters
---- @return table Array of 5 T-junction characters (left, right, top, bottom, cross)
-local function get_border_chars()
-  local winborder = vim.o.winborder or 'single'
-
-  if BORDER_PRESETS[winborder] then return BORDER_PRESETS[winborder], T_JUNCTION_PRESETS[winborder] end
-  return BORDER_PRESETS.single, T_JUNCTION_PRESETS.single
-end
-
---- Resolve a corner glyph based on adjacency flags. Each neighbour flag means
---- another float shares the edge meeting at that corner, so the corner needs
---- to extend a stem in that direction instead of being a plain corner.
---- @param corner string Default corner glyph (e.g. '┌')
---- @param chars table Border preset
---- @param j table T-junction preset { left, right, top, bottom, cross }
---- @param which 'tl'|'tr'|'bl'|'br' Which corner we're computing
---- @param n table { up=bool, down=bool, left=bool, right=bool } adjacency
---- @return string
-local function resolve_corner(corner, chars, j, which, n)
-  -- Stems present at this corner from the float's own borders.
-  local stems = {
-    tl = { down = chars[8] ~= '', right = chars[2] ~= '' },
-    tr = { down = chars[4] ~= '', left = chars[2] ~= '' },
-    bl = { up = chars[8] ~= '', right = chars[6] ~= '' },
-    br = { up = chars[4] ~= '', left = chars[6] ~= '' },
-  }
-  local s = stems[which]
-  -- Compose final stems from own + neighbours
-  local up = s.up or n.up
-  local down = s.down or n.down
-  local left = s.left or n.left
-  local right = s.right or n.right
-  local count = (up and 1 or 0) + (down and 1 or 0) + (left and 1 or 0) + (right and 1 or 0)
-  if count >= 4 then return j[5] end
-  if up and down and (left or right) then return left and j[2] or j[1] end
-  if left and right and (up or down) then return up and j[4] or j[3] end
-  return corner
-end
-
-local function get_prompt_position()
-  local config = M.state.config
-
-  if config and config.layout and config.layout.prompt_position then
-    local terminal_width = vim.o.columns
-    local terminal_height = vim.o.lines
-
-    return utils.resolve_config_value(
-      config.layout.prompt_position,
-      terminal_width,
-      terminal_height,
-      function(value) return utils.is_one_of(value, { 'top', 'bottom' }) end,
-      'bottom',
-      'layout.prompt_position'
-    )
-  end
-
-  return 'bottom'
-end
-
-local function get_preview_position()
-  local config = M.state.config
-
-  if config and config.layout and config.layout.preview_position then
-    local terminal_width = vim.o.columns
-    local terminal_height = vim.o.lines
-
-    local position = utils.resolve_config_value(
-      config.layout.preview_position,
-      terminal_width,
-      terminal_height,
-      function(value) return utils.is_one_of(value, { 'left', 'right', 'top', 'bottom' }) end,
-      'right',
-      'layout.preview_position'
-    )
-
-    local flex = config.layout.flex
-    if flex then
-      local size = flex.size or 80
-      local wrap = flex.wrap or 'top'
-      if terminal_width < size then return wrap end
-    end
-
-    return position
-  end
-
-  return 'right'
-end
-
-local function compute_layout(config)
-  local debug_enabled_in_preview = M.enabled_preview() and config.debug and config.debug.enabled or false
-
-  local terminal_width = vim.o.columns
-  local terminal_height = vim.o.lines
-
-  local width_ratio = utils.resolve_config_value(
-    config.layout.width,
-    terminal_width,
-    terminal_height,
-    utils.is_valid_ratio,
-    0.8,
-    'layout.width'
-  )
-  local height_ratio = utils.resolve_config_value(
-    config.layout.height,
-    terminal_width,
-    terminal_height,
-    utils.is_valid_ratio,
-    0.8,
-    'layout.height'
-  )
-
-  local width = math.floor(terminal_width * width_ratio)
-  local height = math.floor(terminal_height * height_ratio)
-
-  -- Account for chrome (statusline, tabline, cmdheight) for edge-anchored positions
-  local has_tabline = vim.o.showtabline == 2 or (vim.o.showtabline == 1 and #vim.api.nvim_list_tabpages() > 1)
-  local has_statusline = vim.o.laststatus > 0
-  local top_edge = has_tabline and 1 or 0
-  local bottom_edge = terminal_height - vim.o.cmdheight - (has_statusline and 1 or 0)
-  local usable_height = bottom_edge - top_edge
-  height = math.min(height, usable_height)
-
-  -- Anchor controls default placement; manual col/row overrides still work
-  local anchor = utils.resolve_config_value(
-    config.layout.anchor,
-    terminal_width,
-    terminal_height,
-    function(v)
-      return utils.is_one_of(v, {
-        'center',
-        'top_left',
-        'top',
-        'top_right',
-        'left',
-        'right',
-        'bottom_left',
-        'bottom',
-        'bottom_right',
-      })
-    end,
-    'center',
-    'layout.anchor'
-  )
-
-  -- Compute default positions as direct pixel values.
-  -- Edge-flush anchors compensate for offsets added by calculate_layout_dimensions:
-  --   col: -1 for left (internal +1 on list_col makes it flush)
-  --        -2 for right (internal +1 plus the preview window's independent right border)
-  --   row: -1 for top/bottom (internal +1 on rows; bottom also accounts for chrome via bottom_edge)
-  local center_col = math.floor((terminal_width - width) / 2)
-  local center_row = top_edge + math.floor((usable_height - height) / 2)
-
-  -- At fullscreen the centering formula yields 0/top_edge, but calculate_layout_dimensions
-  -- adds +1 internally to position content. Compensate like edge-flush anchors do.
-  if width >= terminal_width then center_col = -1 end
-  if height >= usable_height then center_row = top_edge - 1 end
-  local anchor_positions = {
-    center = {
-      col = center_col,
-      row = center_row,
-    },
-    top_left = {
-      col = -1,
-      row = top_edge - 1,
-    },
-    top = {
-      col = center_col,
-      row = top_edge - 1,
-    },
-    top_right = {
-      col = terminal_width - width - 2,
-      row = top_edge - 1,
-    },
-    left = {
-      col = -1,
-      row = center_row,
-    },
-    right = {
-      col = terminal_width - width - 2,
-      row = center_row,
-    },
-    bottom_left = {
-      col = -1,
-      row = bottom_edge - height - 1,
-    },
-    bottom = {
-      col = center_col,
-      row = bottom_edge - height - 1,
-    },
-    bottom_right = {
-      col = terminal_width - width - 2,
-      row = bottom_edge - height - 1,
-    },
-  }
-
-  local pos = anchor_positions[anchor] or anchor_positions.center
-  local col = pos.col
-  local row = pos.row
-
-  -- Allow manual ratio overrides (backwards compat)
-  if config.layout.col ~= nil then
-    local col_ratio = utils.resolve_config_value(
-      config.layout.col,
-      terminal_width,
-      terminal_height,
-      utils.is_valid_ratio,
-      col / terminal_width,
-      'layout.col'
-    )
-    col = math.floor(terminal_width * col_ratio)
-  end
-  if config.layout.row ~= nil then
-    local row_ratio = utils.resolve_config_value(
-      config.layout.row,
-      terminal_width,
-      terminal_height,
-      utils.is_valid_ratio,
-      row / terminal_height,
-      'layout.row'
-    )
-    row = math.floor(terminal_height * row_ratio)
-  end
-
-  local prompt_position = get_prompt_position()
-  local preview_position = get_preview_position()
-
-  local preview_size_ratio = utils.resolve_config_value(
-    config.layout.preview_size,
-    terminal_width,
-    terminal_height,
-    utils.is_valid_ratio,
-    0.4,
-    'layout.preview_size'
-  )
-
-  local is_fullscreen = width >= terminal_width and height >= usable_height
-
-  local layout_config = {
-    total_width = width,
-    -- Top/bottom preview with prompt-top has a 2-row chrome over-subtraction in
-    -- calculate_layout_dimensions (BORDER_SIZE is subtracted twice). Compensate at fullscreen.
-    total_height = (
-      is_fullscreen
-      and prompt_position == 'top'
-      and (preview_position == 'top' or preview_position == 'bottom')
-    )
-        and height + 2
-      or height,
-    start_col = col,
-    start_row = row,
-    preview_position = preview_position,
-    prompt_position = prompt_position,
-    debug_enabled = debug_enabled_in_preview,
-    preview_width = M.enabled_preview() and math.floor(width * preview_size_ratio) or 0,
-    preview_height = M.enabled_preview() and math.floor(height * preview_size_ratio) or 0,
-    separator_width = 3,
-    file_info_height = debug_enabled_in_preview and 10 or 0,
-  }
-
-  local layout = M.calculate_layout_dimensions(layout_config)
-  return layout, debug_enabled_in_preview
-end
-
---- Build window config tables for list, input, preview, and file_info windows.
---- @param layout table The computed layout from calculate_layout_dimensions
---- @param config table The picker config
---- @return table window_configs Table with list, input, preview, file_info keys
-local function build_window_configs(layout, config)
-  local border_chars, t_junctions = get_border_chars()
-  local prompt_position = get_prompt_position()
-  local preview_position = get_preview_position()
-  local has_preview = layout.preview ~= nil
-  local title = ' ' .. (config.title or 'FFFiles') .. ' '
-
-  -- Adjacency flags. Used to decide which corners need T-junctions because a
-  -- neighbouring float shares that edge.
-  local list_neighbour_input_top = prompt_position == 'top'
-  local list_neighbour_input_bottom = prompt_position == 'bottom'
-  local list_neighbour_preview_top = has_preview and preview_position == 'top'
-  local list_neighbour_preview_bottom = has_preview and preview_position == 'bottom'
-  local list_neighbour_preview_left = has_preview and preview_position == 'left'
-  local list_neighbour_preview_right = has_preview and preview_position == 'right'
-
-  -- A side preview shares a *column* (vertical) with the list. Express that
-  -- as up+down neighbour stems on the corners next to that column. The
-  -- horizontal-side stem (`left`/`right`) is only added when the corner row
-  -- is also the preview's top/bottom edge row — i.e. the picker's outer
-  -- top/bottom edge AND no input/preview is stacked above/below the list at
-  -- that side.
-  local list_top_at_picker_top = (not list_neighbour_preview_top) and not list_neighbour_input_top
-  local list_bottom_at_picker_bottom = (not list_neighbour_preview_bottom) and not list_neighbour_input_bottom
-
-  -- Top corners only get an `up` stem if something is genuinely above this
-  -- row (input or preview stacked above). A side preview shares the column
-  -- but starts at the same top row, so it contributes a `down` stem only.
-  local corners = {
-    tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
-      up = list_neighbour_preview_top or list_neighbour_input_top,
-      down = list_neighbour_preview_left,
-      left = list_neighbour_preview_left and list_top_at_picker_top,
-    }),
-    tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
-      up = list_neighbour_preview_top or list_neighbour_input_top,
-      down = list_neighbour_preview_right,
-      right = list_neighbour_preview_right and list_top_at_picker_top,
-    }),
-    br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
-      down = list_neighbour_preview_bottom or list_neighbour_input_bottom,
-      up = list_neighbour_preview_right,
-      right = list_neighbour_preview_right and list_bottom_at_picker_bottom,
-    }),
-    bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
-      down = list_neighbour_preview_bottom or list_neighbour_input_bottom,
-      up = list_neighbour_preview_left,
-      left = list_neighbour_preview_left and list_bottom_at_picker_bottom,
-    }),
-  }
-
-  -- Drop the bottom row on bottom-prompt (input owns it); top row on top-prompt.
-  local list_border = prompt_position == 'bottom'
-      and { corners.tl, border_chars[2], corners.tr, border_chars[4], '', '', '', border_chars[8] }
-    or {
-      corners.tl,
-      border_chars[2],
-      corners.tr,
-      border_chars[4],
-      corners.br,
-      border_chars[6],
-      corners.bl,
-      border_chars[8],
-    }
-
-  local list_cfg = {
-    relative = 'editor',
-    width = math.max(1, layout.list_width),
-    height = math.max(1, layout.list_height),
-    col = layout.list_col,
-    row = layout.list_row,
-    border = list_border,
-    style = 'minimal',
-    zindex = 52,
-  }
-  if prompt_position == 'bottom' then
-    list_cfg.title = title
-    list_cfg.title_pos = 'left'
-  end
-
-  -- Input is glued to the list along one row, and (when preview is on
-  -- top/bottom) it can also touch the preview on the other row. Side-by-side
-  -- previews share the input's left/right column too.
-  local input_neighbour_preview_left = has_preview and preview_position == 'left'
-  local input_neighbour_preview_right = has_preview and preview_position == 'right'
-  local input_neighbour_preview_top = has_preview and preview_position == 'top' and prompt_position == 'top'
-  local input_neighbour_preview_bottom = has_preview and preview_position == 'bottom' and prompt_position == 'bottom'
-
-  -- Side-by-side preview shares a *column* (vertical) with the input. The
-  -- preview vertical extends past the input corner on both sides, so we add
-  -- `up`/`down` neighbour stems. When the input ALSO sits at the top edge
-  -- of the picker (prompt=top) the preview top horizontal extends from the
-  -- shared corner toward the preview, so we need a horizontal stem too.
-  local input_top_at_picker_top = prompt_position == 'top'
-  local input_bottom_at_picker_bottom = prompt_position == 'bottom'
-
-  -- For each top corner figure out whether a vertical extends UP past it
-  -- (true only if the input is glued to a list/preview *above*) and whether
-  -- a horizontal extends OUT (true only if a side preview *also* shares the
-  -- same top-edge row, i.e. prompt=top with side preview).
-  local function tl_extends_up()
-    if prompt_position == 'bottom' then return true end -- list above
-    if input_neighbour_preview_top then return true end -- preview stack above
-    return false
-  end
-  local function tr_extends_up() return tl_extends_up() end
-  local function bl_extends_down()
-    if prompt_position == 'top' then return true end -- list below
-    if input_neighbour_preview_bottom then return true end -- preview stack below
-    return false
-  end
-  local function br_extends_down() return bl_extends_down() end
-
-  local function input_corners()
-    return {
-      tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
-        up = tl_extends_up(),
-        -- side preview shares the column → preview vertical extends from this
-        -- corner downward when input is at the top edge, upward when at the
-        -- bottom edge. Horizontal stem (`left`/`right`) only when the corner
-        -- row is also the preview top/bottom row (true at picker outer edge).
-        down = input_neighbour_preview_left and input_top_at_picker_top,
-        left = input_neighbour_preview_left and input_top_at_picker_top,
-      }),
-      tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
-        up = tr_extends_up(),
-        down = input_neighbour_preview_right and input_top_at_picker_top,
-        right = input_neighbour_preview_right and input_top_at_picker_top,
-      }),
-      br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
-        down = br_extends_down(),
-        up = input_neighbour_preview_right and input_bottom_at_picker_bottom,
-        right = input_neighbour_preview_right and input_bottom_at_picker_bottom,
-      }),
-      bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
-        down = bl_extends_down(),
-        up = input_neighbour_preview_left and input_bottom_at_picker_bottom,
-        left = input_neighbour_preview_left and input_bottom_at_picker_bottom,
-      }),
-    }
-  end
-  local ic = input_corners()
-  local input_border = prompt_position == 'bottom'
-      and { ic.tl, border_chars[2], ic.tr, border_chars[4], ic.br, border_chars[6], ic.bl, border_chars[8] }
-    or { ic.tl, border_chars[2], ic.tr, border_chars[4], '', '', '', border_chars[8] }
-
-  local input_cfg = {
-    relative = 'editor',
-    width = math.max(1, layout.input_width),
-    height = 1,
-    col = layout.input_col,
-    row = layout.input_row,
-    border = input_border,
-    style = 'minimal',
-    zindex = 53,
-  }
-  if prompt_position == 'top' then
-    input_cfg.title = title
-    input_cfg.title_pos = 'left'
-  end
-
-  local preview_cfg = nil
-  if layout.preview then
-    -- Preview corners that touch the list/input column share verticals with
-    -- those floats; the other side stays a plain corner. When the debug
-    -- file_info panel is rendered above the preview, the preview's top edge
-    -- additionally meets the file_info's bottom edge.
-    local has_file_info_above = layout.file_info ~= nil
-    local preview_corners = {
-      tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
-        right = preview_position == 'left',
-        up = has_file_info_above,
-      }),
-      tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
-        left = preview_position == 'right',
-        up = has_file_info_above,
-      }),
-      br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
-        left = preview_position == 'right',
-      }),
-      bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
-        right = preview_position == 'left',
-      }),
-    }
-    -- For top/bottom preview position we additionally have a shared row with
-    -- the list; the matching horizontal edge gets T-junctions.
-    if preview_position == 'top' then
-      preview_corners.bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', { down = true })
-      preview_corners.br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', { down = true })
-    elseif preview_position == 'bottom' then
-      preview_corners.tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', { up = true })
-      preview_corners.tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', { up = true })
-    end
-    local pc = preview_corners
-    local preview_border = {
-      pc.tl,
-      border_chars[2],
-      pc.tr,
-      border_chars[4],
-      pc.br,
-      border_chars[6],
-      pc.bl,
-      border_chars[8],
-    }
-    preview_cfg = {
-      relative = 'editor',
-      width = math.max(1, layout.preview.width),
-      height = math.max(1, layout.preview.height),
-      col = layout.preview.col,
-      row = layout.preview.row,
-      style = 'minimal',
-      border = preview_border,
-      -- Title hidden when file_info is rendered above — its footer already
-      -- says "Preview". Otherwise show the preview title with the active
-      -- file's relative path (set in update_preview_title).
-      title = layout.file_info and '' or ' Preview ',
-      title_pos = 'left',
-      zindex = 51,
-    }
-  end
-
-  local file_info_cfg = nil
-  if layout.file_info then
-    -- file_info sits on top of the preview. The corner shared with the list's
-    -- right vertical (preview=right) gets a horizontal stem pointing *into*
-    -- the list at the top, so the corner reads as a `┬` instead of `┌`.
-    -- Symmetric for preview=left.
-    local list_meets_fi_left = preview_position == 'right'
-    local list_meets_fi_right = preview_position == 'left'
-    local fi_corners = {
-      tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
-        -- preview=right -> list lives to the left of file_info's tl, list
-        -- top horizontal stem points right *into* the corner.
-        left = list_meets_fi_left,
-      }),
-      tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
-        right = list_meets_fi_right,
-      }),
-      -- bl/br share a row with the preview top. The file_info bottom row IS
-      -- the preview top row, so the corner doubles as preview's top corner:
-      -- only add a `down` stem (preview vertical extends below). The list's
-      -- adjacent column has *vertical* there, not horizontal, so we don't
-      -- add a left/right stem here — the list verticals stay continuous and
-      -- the corner reads as `├` / `┤`.
-      bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
-        down = true,
-      }),
-      br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
-        down = true,
-      }),
-    }
-    local fi_border = {
-      fi_corners.tl,
-      border_chars[2],
-      fi_corners.tr,
-      border_chars[4],
-      fi_corners.br,
-      border_chars[6],
-      fi_corners.bl,
-      border_chars[8],
-    }
-    file_info_cfg = {
-      relative = 'editor',
-      width = math.max(1, layout.file_info.width),
-      height = math.max(1, layout.file_info.height),
-      col = layout.file_info.col,
-      row = layout.file_info.row,
-      style = 'minimal',
-      border = fi_border,
-      title = ' File Info ',
-      title_pos = 'left',
-      -- Above the list zindex so the file_info borders win over the list's
-      -- shared-column verticals at junction cells, and above the preview so
-      -- the shared bottom-border row reads as file_info's `├──┤`.
-      zindex = 53,
-    }
-  end
-
-  return {
-    list = list_cfg,
-    input = input_cfg,
-    preview = preview_cfg,
-    file_info = file_info_cfg,
-  }
-end
-
---- Calculate layout dimensions and positions for all windows
---- @param cfg table
---- @return table Layout configuration
-function M.calculate_layout_dimensions(cfg)
-  local BORDER_SIZE = 2
-  local PROMPT_HEIGHT = 2
-  local SEPARATOR_WIDTH = 1
-  local SEPARATOR_HEIGHT = 1
-
-  if not utils.is_one_of(cfg.preview_position, { 'left', 'right', 'top', 'bottom' }) then
-    error('Invalid preview position: ' .. tostring(cfg.preview_position))
-  end
-
-  local layout = {}
-  local preview_enabled = M.enabled_preview()
-
-  -- Section 1: Base dimensions and bounds checking
-  local total_width = math.max(0, cfg.total_width - BORDER_SIZE)
-  local total_height = math.max(0, cfg.total_height - BORDER_SIZE - PROMPT_HEIGHT)
-
-  -- Section 2: Calculate dimensions based on preview position
-  if cfg.preview_position == 'left' then
-    local separator_width = preview_enabled and SEPARATOR_WIDTH or 0
-    local list_width = math.max(0, total_width - cfg.preview_width - separator_width)
-    local list_height = total_height
-
-    layout.list_col = cfg.start_col + cfg.preview_width + 2 -- +2 for borders (shared separator column)
-    layout.list_width = list_width
-    layout.list_height = list_height
-    layout.input_col = layout.list_col
-    layout.input_width = list_width
-
-    if preview_enabled then
-      layout.preview = {
-        col = cfg.start_col + 1,
-        row = cfg.start_row + 1,
-        width = cfg.preview_width,
-        height = list_height,
-      }
-    end
-  elseif cfg.preview_position == 'right' then
-    local separator_width = preview_enabled and SEPARATOR_WIDTH or 0
-    local list_width = math.max(0, total_width - cfg.preview_width - separator_width)
-    local list_height = total_height
-
-    layout.list_col = cfg.start_col + 1
-    layout.list_width = list_width
-    layout.list_height = list_height
-    layout.input_col = layout.list_col
-    layout.input_width = list_width
-
-    if preview_enabled then
-      layout.preview = {
-        col = cfg.start_col + list_width + 2, -- +2 for borders (shared separator column)
-        row = cfg.start_row + 1,
-        width = cfg.preview_width,
-        height = list_height,
-      }
-    end
-  elseif cfg.preview_position == 'top' then
-    local separator_height = preview_enabled and SEPARATOR_HEIGHT or 0
-    local list_height = math.max(0, total_height - cfg.preview_height - separator_height)
-
-    layout.list_col = cfg.start_col + 1
-    layout.list_width = total_width
-    layout.list_height = list_height
-    layout.input_col = layout.list_col
-    layout.input_width = total_width
-    layout.list_start_row = cfg.start_row + (preview_enabled and (cfg.preview_height + separator_height) or 0) + 1
-
-    if preview_enabled then
-      layout.preview = {
-        col = cfg.start_col + 1,
-        row = cfg.start_row + 1,
-        width = total_width,
-        height = cfg.preview_height,
-      }
-    end
-  else
-    local separator_height = preview_enabled and SEPARATOR_HEIGHT or 0
-    local list_height = math.max(0, total_height - cfg.preview_height - separator_height)
-
-    layout.list_col = cfg.start_col + 1
-    layout.list_width = total_width
-    layout.list_height = list_height
-    layout.input_col = layout.list_col
-    layout.input_width = total_width
-    layout.list_start_row = cfg.start_row + 1
-
-    if preview_enabled then
-      layout.preview = {
-        col = cfg.start_col + 1,
-        width = total_width,
-        height = cfg.preview_height,
-      }
-    end
-  end
-
-  -- Section 3: Position prompt and adjust row positions
-  if cfg.preview_position == 'left' or cfg.preview_position == 'right' then
-    if cfg.prompt_position == 'top' then
-      layout.input_row = cfg.start_row + 1
-      layout.list_row = cfg.start_row + PROMPT_HEIGHT + 1
-    else
-      layout.list_row = cfg.start_row + 1
-      layout.input_row = cfg.start_row + cfg.total_height - BORDER_SIZE
-    end
-
-    if layout.preview then
-      if cfg.prompt_position == 'top' then
-        layout.preview.row = cfg.start_row + 1
-        layout.preview.height = cfg.total_height - BORDER_SIZE
-      else
-        layout.preview.row = cfg.start_row + 1
-        layout.preview.height = cfg.total_height - BORDER_SIZE
-      end
-    end
-  else
-    local list_start_row = layout.list_start_row
-    if cfg.prompt_position == 'top' then
-      layout.input_row = list_start_row
-      layout.list_row = list_start_row + BORDER_SIZE
-      layout.list_height = math.max(0, layout.list_height - BORDER_SIZE)
-    else
-      layout.list_row = list_start_row
-      layout.input_row = list_start_row + layout.list_height + 1
-    end
-
-    if cfg.preview_position == 'bottom' and layout.preview then
-      if cfg.prompt_position == 'top' then
-        layout.preview.row = layout.list_row + layout.list_height + 1
-      else
-        layout.preview.row = layout.input_row + PROMPT_HEIGHT
-      end
-    end
-  end
-
-  -- Section 4: Position debug panel (if enabled)
-  -- Only shown in side-by-side preview layouts. When the layout has wrapped
-  -- to a stacked top/bottom preview (compact view), the preview is already
-  -- short — squeezing in a debug panel makes both unreadable.
-  local is_side_by_side = cfg.preview_position == 'left' or cfg.preview_position == 'right'
-  if cfg.debug_enabled and preview_enabled and layout.preview and is_side_by_side then
-    layout.file_info = {
-      width = layout.preview.width,
-      height = cfg.file_info_height,
-      col = layout.preview.col,
-      row = layout.preview.row,
-    }
-    -- Stack preview directly below file_info so they share a border row;
-    -- the shared row resolves to ├──...──┤ T-junctions instead of two
-    -- adjacent corners.
-    local consumed = cfg.file_info_height + 1 -- file_info content + its bottom border row
-    layout.preview.row = layout.preview.row + consumed
-    layout.preview.height = math.max(3, layout.preview.height - consumed)
-  end
-
-  return layout
-end
+local canonicalize_fff_path = utils.canonicalize_fff_path
 
 local preview_config = conf.get().preview
 if preview_config then preview.setup(preview_config) end
+
+local function get_prompt_position() return layout.resolve_prompt_position(M.state.config) end
 
 local function suspend_paste()
   if not vim.o.paste then return false end
@@ -787,6 +40,7 @@ M.state = {
   file_info_buf = nil,
   preview_win = nil,
   preview_buf = nil,
+  preview_visible = false, -- True when preview window will be rendered (config + screen size)
 
   items = {},
   filtered_items = {},
@@ -859,6 +113,78 @@ M.state = {
   suggestion_source = nil,
 }
 
+local function open_preview(win_cfg)
+  if not win_cfg then return end
+  if M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win) then return end
+
+  if not (M.state.preview_buf and vim.api.nvim_buf_is_valid(M.state.preview_buf)) then
+    M.state.preview_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.preview_buf })
+    vim.api.nvim_buf_set_name(M.state.preview_buf, 'fffile preview')
+    vim.api.nvim_set_option_value('buftype', 'nofile', { buf = M.state.preview_buf })
+    vim.api.nvim_set_option_value('filetype', 'fff_preview', { buf = M.state.preview_buf })
+    vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.preview_buf })
+  end
+
+  M.state.preview_win = vim.api.nvim_open_win(M.state.preview_buf, false, win_cfg)
+
+  local hl = M.state.config.hl
+  local win_hl = string.format('Normal:%s,FloatBorder:%s,FloatTitle:%s', hl.normal, hl.border, hl.title)
+  local cursorlineopt = utils.resolve_config_value(
+    preview_config.cursorlineopt,
+    vim.o.columns,
+    vim.o.lines,
+    function(value)
+      if type(value) ~= 'string' or #value == 0 then return false end
+      local has_line, has_screenline = false, false
+      for opt in value:gmatch('[^,]+') do
+        if not utils.is_one_of(opt:gsub('%s+', ''), { 'line', 'screenline', 'number', 'both' }) then return false end
+        if opt == 'line' or opt == 'both' then has_line = true end
+        if opt == 'screenline' then has_screenline = true end
+      end
+      return not (has_line and has_screenline)
+    end,
+    'both',
+    'preview.cursorlineopt'
+  )
+
+  vim.api.nvim_set_option_value('wrap', false, { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('cursorline', M.state.mode == 'grep', { win = M.state.preview_win })
+  vim.api.nvim_set_option_value(
+    'cursorlineopt',
+    M.state.mode == 'grep' and cursorlineopt or vim.o.cursorlineopt,
+    { win = M.state.preview_win }
+  )
+  vim.api.nvim_set_option_value(
+    'number',
+    M.state.mode == 'grep' or (preview_config and preview_config.line_numbers or false),
+    { win = M.state.preview_win }
+  )
+  vim.api.nvim_set_option_value('relativenumber', false, { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('signcolumn', 'no', { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.preview_win })
+
+  preview.set_preview_window(M.state.preview_win)
+end
+
+--- Tear down the preview window and buffer. Called when the layout decides
+--- the preview no longer fits.
+local function close_preview()
+  if M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win) then
+    vim.api.nvim_win_close(M.state.preview_win, true)
+  end
+  M.state.preview_win = nil
+
+  if M.state.preview_buf and vim.api.nvim_buf_is_valid(M.state.preview_buf) then
+    preview.clear_buffer(M.state.preview_buf)
+    vim.api.nvim_buf_delete(M.state.preview_buf, { force = true })
+  end
+  M.state.preview_buf = nil
+  M.state.last_preview_file = nil
+  M.state.last_preview_location = nil
+end
+
 function M.create_ui()
   local config = M.state.config
   if not config then return false end
@@ -871,19 +197,18 @@ function M.create_ui()
     list_separator.init(M.state.ns_id)
   end
 
-  local layout, debug_enabled_in_preview = compute_layout(config)
-  M.state.layout = layout
+  local computed_layout = layout.compute(config, conf.preview_enabled(config))
+  local win_configs = computed_layout.win_configs
+  local debug_enabled_in_preview = computed_layout.debug_enabled
+
+  M.state.layout = computed_layout.layout
+  M.state.preview_visible = computed_layout.preview_visible
 
   M.state.input_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.input_buf })
 
   M.state.list_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.list_buf })
-
-  if M.enabled_preview() then
-    M.state.preview_buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.preview_buf })
-  end
 
   if debug_enabled_in_preview then
     M.state.file_info_buf = vim.api.nvim_create_buf(false, true)
@@ -892,8 +217,6 @@ function M.create_ui()
     M.state.file_info_buf = nil
   end
 
-  local win_configs = build_window_configs(layout, config)
-
   M.state.list_win = vim.api.nvim_open_win(M.state.list_buf, false, win_configs.list)
   if debug_enabled_in_preview and win_configs.file_info then
     M.state.file_info_win = vim.api.nvim_open_win(M.state.file_info_buf, false, win_configs.file_info)
@@ -901,9 +224,7 @@ function M.create_ui()
     M.state.file_info_win = nil
   end
 
-  if M.enabled_preview() and win_configs.preview then
-    M.state.preview_win = vim.api.nvim_open_win(M.state.preview_buf, false, win_configs.preview)
-  end
+  if M.state.preview_visible then open_preview(win_configs.preview) end
 
   M.state.input_win = vim.api.nvim_open_win(M.state.input_buf, false, win_configs.input)
 
@@ -912,8 +233,6 @@ function M.create_ui()
   M.setup_keymaps()
 
   vim.api.nvim_set_current_win(M.state.input_win)
-
-  preview.set_preview_window(M.state.preview_win)
 
   M.update_results_sync()
   M.clear_preview()
@@ -925,7 +244,6 @@ end
 function M.setup_buffers()
   vim.api.nvim_buf_set_name(M.state.input_buf, 'fffile search')
   vim.api.nvim_buf_set_name(M.state.list_buf, 'fffiles list')
-  if M.enabled_preview() then vim.api.nvim_buf_set_name(M.state.preview_buf, 'fffile preview') end
 
   vim.api.nvim_set_option_value('buftype', 'prompt', { buf = M.state.input_buf })
   vim.api.nvim_set_option_value('filetype', 'fff_input', { buf = M.state.input_buf })
@@ -947,12 +265,6 @@ function M.setup_buffers()
     vim.api.nvim_set_option_value('buftype', 'nofile', { buf = M.state.file_info_buf })
     vim.api.nvim_set_option_value('filetype', 'fff_file_info', { buf = M.state.file_info_buf })
     vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.file_info_buf })
-  end
-
-  if M.enabled_preview() then
-    vim.api.nvim_set_option_value('buftype', 'nofile', { buf = M.state.preview_buf })
-    vim.api.nvim_set_option_value('filetype', 'fff_preview', { buf = M.state.preview_buf })
-    vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.preview_buf })
   end
 end
 
@@ -984,50 +296,6 @@ function M.setup_windows()
     vim.api.nvim_set_option_value('signcolumn', 'no', { win = M.state.file_info_win })
     vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.file_info_win })
     vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.file_info_win })
-  end
-
-  if M.enabled_preview() then
-    vim.api.nvim_set_option_value('wrap', false, { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('cursorline', M.state.mode == 'grep', { win = M.state.preview_win })
-
-    local cursorlineopt = utils.resolve_config_value(
-      preview_config.cursorlineopt,
-      vim.o.columns,
-      vim.o.lines,
-      function(value)
-        if type(value) ~= 'string' or #value == 0 then return false end
-
-        local has_line = false
-        local has_screenline = false
-        for opt in value:gmatch('[^,]+') do
-          if not utils.is_one_of(opt:gsub('%s+', ''), { 'line', 'screenline', 'number', 'both' }) then return false end
-          if opt == 'line' or opt == 'both' then has_line = true end
-          if opt == 'screenline' then has_screenline = true end
-        end
-
-        if has_line and has_screenline then return false end
-
-        return true
-      end,
-      'both',
-      'preview.cursorlineopt'
-    )
-
-    vim.api.nvim_set_option_value(
-      'cursorlineopt',
-      M.state.mode == 'grep' and cursorlineopt or vim.o.cursorlineopt,
-      { win = M.state.preview_win }
-    )
-
-    vim.api.nvim_set_option_value(
-      'number',
-      M.state.mode == 'grep' or (preview_config and preview_config.line_numbers or false),
-      { win = M.state.preview_win }
-    )
-    vim.api.nvim_set_option_value('relativenumber', false, { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('signcolumn', 'no', { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.preview_win })
   end
 
   local picker_group = vim.api.nvim_create_augroup('fff_picker_focus', { clear = true })
@@ -1659,7 +927,7 @@ end
 --- Same-file location changes are instant; file changes are debounced
 --- to avoid visible preview flicker when scrolling rapidly through grep results.
 function M.update_preview_smart()
-  if not M.enabled_preview() then return end
+  if not M.state.preview_visible then return end
   if not M.state.active then return end
 
   local items = M.state.filtered_items
@@ -2060,7 +1328,7 @@ function M.update_preview_title(item, location)
 end
 
 function M.update_preview()
-  if not M.enabled_preview() then return end
+  if not M.state.preview_visible then return end
   if not M.state.active then return end
 
   local items = M.state.filtered_items
@@ -2149,13 +1417,13 @@ function M.update_preview()
   end
 
   preview.set_preview_window(M.state.preview_win)
-  preview.preview(resolve_item_path(item), M.state.preview_buf, effective_location, item.is_binary)
+  preview.preview(canonicalize_fff_path(item.relative_path), M.state.preview_buf, effective_location, item.is_binary)
 end
 
 --- Clear preview
 function M.clear_preview()
   if not M.state.active then return end
-  if not M.enabled_preview() then return end
+  if not M.state.preview_visible then return end
 
   vim.api.nvim_win_set_config(M.state.preview_win, {
     title = ' Preview ',
@@ -2711,7 +1979,7 @@ function M.send_to_quickfix()
     if has_selections then
       -- Use explicitly selected items (survives page changes)
       for _, item in pairs(M.state.selected_items) do
-        local abs = resolve_item_path(item)
+        local abs = canonicalize_fff_path(item.relative_path)
         if abs then
           table.insert(qf_list, {
             filename = abs,
@@ -2734,7 +2002,7 @@ function M.send_to_quickfix()
       end
 
       for _, item in ipairs(all_items) do
-        local abs = resolve_item_path(item)
+        local abs = canonicalize_fff_path(item.relative_path)
         if abs then
           table.insert(qf_list, {
             filename = abs,
@@ -2757,7 +2025,7 @@ function M.send_to_quickfix()
       end
     else
       for _, item in ipairs(M.state.filtered_items) do
-        local abs = resolve_item_path(item)
+        local abs = canonicalize_fff_path(item.relative_path)
         if abs then table.insert(paths, abs) end
       end
     end
@@ -2804,7 +2072,7 @@ function M.select(action)
   -- Anchor against the indexer's base_path (may differ from cwd), then rephrase
   -- as cwd-relative for a nicer buffer name when possible. When outside cwd,
   -- fnamemodify(':.') leaves the absolute path intact.
-  local abs_path = resolve_item_path(item)
+  local abs_path = canonicalize_fff_path(item.relative_path)
   if not abs_path then return end
   local relative_path = vim.fn.fnamemodify(abs_path, ':.')
   local location = M.state.location -- Capture location before closing
@@ -2897,10 +2165,10 @@ function M.relayout()
   local config = M.state.config
   if not config then return end
 
-  local layout, _ = compute_layout(config)
-  M.state.layout = layout
-
-  local win_configs = build_window_configs(layout, config)
+  local computed_layout = layout.compute(config, conf.preview_enabled(config))
+  local win_configs = computed_layout.win_configs
+  M.state.layout = computed_layout.layout
+  M.state.preview_visible = computed_layout.preview_visible
 
   if M.state.list_win and vim.api.nvim_win_is_valid(M.state.list_win) then
     vim.api.nvim_win_set_config(M.state.list_win, win_configs.list)
@@ -2910,12 +2178,41 @@ function M.relayout()
     vim.api.nvim_win_set_config(M.state.input_win, win_configs.input)
   end
 
-  if M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win) and win_configs.preview then
-    vim.api.nvim_win_set_config(M.state.preview_win, win_configs.preview)
+  -- Reconcile preview window with the new visibility decision. When the
+  -- terminal shrinks past the threshold we close it; when it grows back we
+  -- recreate it.
+  local preview_win_alive = M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win)
+  if M.state.preview_visible and win_configs.preview then
+    if preview_win_alive then
+      vim.api.nvim_win_set_config(M.state.preview_win, win_configs.preview)
+    else
+      open_preview(win_configs.preview)
+    end
+  elseif preview_win_alive then
+    close_preview()
   end
 
-  if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) and win_configs.file_info then
-    vim.api.nvim_win_set_config(M.state.file_info_win, win_configs.file_info)
+  -- File info panel piggybacks on the preview being side-by-side. Close it
+  -- when the new layout drops it; recreate it when the layout brings it back.
+  local file_info_win_alive = M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win)
+  if win_configs.file_info then
+    if file_info_win_alive then
+      vim.api.nvim_win_set_config(M.state.file_info_win, win_configs.file_info)
+    else
+      M.state.file_info_buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.file_info_buf })
+      vim.api.nvim_set_option_value('buftype', 'nofile', { buf = M.state.file_info_buf })
+      vim.api.nvim_set_option_value('filetype', 'fff_file_info', { buf = M.state.file_info_buf })
+      vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.file_info_buf })
+      M.state.file_info_win = vim.api.nvim_open_win(M.state.file_info_buf, false, win_configs.file_info)
+    end
+  elseif file_info_win_alive then
+    vim.api.nvim_win_close(M.state.file_info_win, true)
+    M.state.file_info_win = nil
+    if M.state.file_info_buf and vim.api.nvim_buf_is_valid(M.state.file_info_buf) then
+      vim.api.nvim_buf_delete(M.state.file_info_buf, { force = true })
+    end
+    M.state.file_info_buf = nil
   end
 
   -- now rerenderw ith the new computed windows
@@ -2956,7 +2253,7 @@ function M.close()
     M.state.list_buf,
     M.state.file_info_buf,
   }
-  if M.enabled_preview() then buffers[#buffers + 1] = M.state.preview_buf end
+  if M.state.preview_buf then buffers[#buffers + 1] = M.state.preview_buf end
 
   for _, buf in ipairs(buffers) do
     if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -2982,6 +2279,7 @@ function M.close()
   M.state.list_buf = nil
   M.state.file_info_buf = nil
   M.state.preview_buf = nil
+  M.state.preview_visible = false
   M.state.items = {}
   M.state.filtered_items = {}
   M.state.cursor = 1
@@ -3160,7 +2458,7 @@ function M.open(opts)
   local merged_config, base_path = initialize_picker(opts)
   if not merged_config then return end
 
-  if base_path then M.change_indexing_directory(base_path) end
+  if base_path then require('fff.core').change_indexing_directory(base_path) end
 
   -- Initialize grep_mode to first configured mode when opening in grep mode
   if M.state.mode == 'grep' then
@@ -3177,34 +2475,6 @@ function M.open(opts)
   return open_ui_with_state(query, nil, nil, merged_config, current_file_cache)
 end
 
---- Change the base directory for the file picker
---- @param new_path string New directory path to use as base
---- @return boolean `true` if successful, `false` otherwise
-function M.change_indexing_directory(new_path)
-  if not new_path or new_path == '' then
-    vim.notify('Directory path is required', vim.log.levels.ERROR)
-    return false
-  end
-
-  local expanded_path = vim.fn.expand(new_path)
-
-  if vim.fn.isdirectory(expanded_path) ~= 1 then
-    vim.notify('Directory does not exist: ' .. expanded_path, vim.log.levels.ERROR)
-    return false
-  end
-
-  local fuzzy = require('fff.core').ensure_initialized()
-  local ok, result = pcall(fuzzy.restart_index_in_path, expanded_path)
-  if not ok then
-    vim.notify('Failed to change directory: ' .. result, vim.log.levels.ERROR)
-    return false
-  end
-
-  local config = require('fff.conf').get()
-  config.base_path = expanded_path
-  return true
-end
-
 function M.monitor_scan_progress(iteration)
   if not M.state.active then return end
 
@@ -3213,6 +2483,7 @@ function M.monitor_scan_progress(iteration)
   if progress.is_scanning then
     M.update_status(progress)
 
+    -- progressive decay for larger directories
     local timeout
     if iteration < 10 then
       timeout = 100
@@ -3226,15 +2497,6 @@ function M.monitor_scan_progress(iteration)
   else
     M.update_results()
   end
-end
-
-M.enabled_preview = function()
-  local preview_state = nil
-
-  if M and M.state and M.state.config then preview_state = M.state.config.preview end
-  if not preview_state then return true end
-
-  return preview_state.enabled
 end
 
 return M

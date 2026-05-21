@@ -79,13 +79,7 @@ local function setup_global_autocmds(config)
       if new_canonical == base_canonical then return end
 
       vim.schedule(function()
-        -- Delay require to avoid circular dependency: core -> main -> picker_ui -> file_picker -> core
-        local ok, picker = pcall(require, 'fff.main')
-        if not ok then
-          vim.notify('FFF: Failed to load main module: ' .. tostring(picker), vim.log.levels.ERROR)
-          return
-        end
-        local change_ok, err = pcall(picker.change_indexing_directory, new_canonical)
+        local change_ok, err = pcall(M.change_indexing_directory, new_canonical)
         if not change_ok then
           vim.notify('FFF: Failed to change indexing directory: ' .. tostring(err), vim.log.levels.ERROR)
         end
@@ -97,6 +91,34 @@ end
 
 --- @return boolean
 M.is_file_picker_initialized = function() return state.file_picker_initialized end
+
+--- Change the base directory for the file picker. Triggers a reindex on the
+--- Rust side and updates `config.base_path` so subsequent `:cd` events compare
+--- against the new root.
+--- @param new_path string New directory path to use as base
+--- @return boolean ok `true` if the reindex was scheduled, `false` otherwise
+M.change_indexing_directory = function(new_path)
+  if not new_path or new_path == '' then
+    vim.notify('Directory path is required', vim.log.levels.ERROR)
+    return false
+  end
+
+  local expanded_path = vim.fn.expand(new_path)
+  if vim.fn.isdirectory(expanded_path) ~= 1 then
+    vim.notify('Directory does not exist: ' .. expanded_path, vim.log.levels.ERROR)
+    return false
+  end
+
+  local fff_rust = M.ensure_initialized()
+  local ok, err = pcall(fff_rust.restart_index_in_path, expanded_path)
+  if not ok then
+    vim.notify('Failed to change directory: ' .. err, vim.log.levels.ERROR)
+    return false
+  end
+
+  require('fff.conf').get().base_path = expanded_path
+  return true
+end
 
 M.ensure_initialized = function()
   if state.initialized then return fuzzy end

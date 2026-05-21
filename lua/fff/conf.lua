@@ -6,6 +6,7 @@ local M = {}
 --- @field prompt_position string
 --- @field preview_position string
 --- @field preview_size number
+--- @field min_list_height number
 --- @field show_scrollbar boolean
 --- @field path_shorten_strategy string
 
@@ -213,6 +214,10 @@ local function init()
         size = 130, -- column threshold: if screen width >= size, use preview_position; otherwise use wrap
         wrap = 'top', -- position to use when screen is narrower than size
       },
+      -- Minimum list height required to render the preview. When the available
+      -- list area would drop below this on small terminals, the preview is
+      -- auto-hidden so the file list stays usable. Set to 0 to disable.
+      min_list_height = 10,
       show_scrollbar = true, -- Show scrollbar for pagination
       -- How to shorten long directory paths in the file list:
       -- 'middle' (default): always uses dots (a/./b, a/../b, a/.../b)
@@ -361,6 +366,17 @@ function M.setup(config) vim.g.fff = config end
 function M.get()
   if not state.config then init() end
   return state.config
+end
+
+--- True when preview rendering is requested by config. Defaults to `true`
+--- when `config` (or its `preview` block) is missing so callers don't have
+--- to guard against partial state during init.
+--- @param config? FffConfig Optional config; falls back to `M.get()` when nil.
+--- @return boolean
+function M.preview_enabled(config)
+  config = config or M.get()
+  if not config or not config.preview then return true end
+  return config.preview.enabled
 end
 
 --- @return boolean state_changed

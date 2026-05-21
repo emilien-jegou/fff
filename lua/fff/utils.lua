@@ -88,4 +88,18 @@ function M.is_one_of(value, values)
   return false
 end
 
+--- Resolve an indexer-relative path to an absolute one against the picker's current `base_path`.
+--- @param relative_path string|nil
+--- @return string|nil
+function M.canonicalize_fff_path(relative_path)
+  if not relative_path or relative_path == '' then return nil end
+  local path = relative_path
+  -- Strip Windows long-path prefix (\\?\) — Neovim cannot open these.
+  if vim.startswith(path, '\\\\?\\') then path = path:sub(5) end
+  if vim.fn.fnamemodify(path, ':p') == path then return path end
+  local base = require('fff.conf').get().base_path
+  if not base or base == '' then return path end
+  return vim.fs.normalize(base .. '/' .. path)
+end
+
 return M
