@@ -239,6 +239,11 @@ impl FrecencyTracker {
         Ok(last.map(|ts| self.get_now().saturating_sub(ts)))
     }
 
+    /// Number of tracked access for file path
+    pub fn access_count(&self, path: &Path) -> Result<usize> {
+        Ok(self.get_accesses(path)?.map_or(0, |a| a.len()))
+    }
+
     pub fn track_access(&self, path: &Path) -> Result<()> {
         let key_hash = Self::path_to_hash_bytes(path)?;
         let mut accesses = self.get_accesses(path)?.unwrap_or_default();

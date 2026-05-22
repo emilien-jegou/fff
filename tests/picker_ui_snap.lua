@@ -27,6 +27,13 @@ local function setup(geometry, opts)
   child.o.lines = geometry.rows
   child.o.columns = geometry.cols
 
+  local debug_enabled = opts.debug == true
+  -- Default show_file_info hides timings: Modified/Accessed timestamps drift
+  -- between runs and would otherwise force `ignore_text` on those rows. Tests
+  -- can override (or restore) by passing `opts.show_file_info`.
+  local show_file_info = opts.show_file_info
+    or { file_info = true, score_breakdown = true, timings = false, full_path = true }
+
   child.lua(
     string.format(
       [[
@@ -41,7 +48,11 @@ local function setup(geometry, opts)
           frecency = { enabled = true, db_path = %q },
           history  = { enabled = true, db_path = %q },
           logging  = { enabled = false },
-          debug    = { enabled = %s, show_scores = %s },
+          debug    = {
+            enabled = %s,
+            show_scores = %s,
+            show_file_info = %s,
+          },
         }
         require('fff.core').ensure_initialized()
         require('fff.rust').wait_for_initial_scan(8000)
@@ -51,8 +62,9 @@ local function setup(geometry, opts)
       geometry.winborder or '',
       fixture.frecency_db,
       fixture.history_db,
-      tostring(opts.debug == true),
-      tostring(opts.debug == true)
+      tostring(debug_enabled),
+      tostring(debug_enabled),
+      vim.inspect(show_file_info)
     )
   )
 end
@@ -86,6 +98,8 @@ local LAYOUTS = {
   { name = 'wide', cols = 180, rows = 40, winborder = 'double' },
   { name = 'default', cols = 140, rows = 32 }, -- standard on most screens
   { name = 'narrow', cols = 70, rows = 24, winborder = 'rounded' },
+  -- Extra-wide: exists primarily so the file_info panel hits the H2 layout.
+  { name = 'xwide', cols = 240, rows = 48 },
 }
 
 local T = MiniTest.new_set()
@@ -132,25 +146,40 @@ for _, geometry in ipairs(LAYOUTS) do
   T[geometry.name] = set
 end
 
--- File info panel only renders in non-flex layouts where there's room for it,
--- so we only exercise it on the default geometry.
-local default_geom = LAYOUTS[2]
-local debug_set = MiniTest.new_set({
+-- File info panel snapshots. Timings are disabled at the config level (see
+-- `setup`) so the snapshots stay deterministic — Modified/Accessed timestamps
+-- drift between runs. We snapshot a narrow and a wide variant for both prompt
+-- positions to keep the adaptive panel layout (label widths, section headers,
+-- top vs bottom prompt geometry) covered.
+local debug_narrow_set = MiniTest.new_set({
   hooks = {
-    pre_case = function() setup(default_geom, { debug = true }) end,
+    pre_case = function() setup(LAYOUTS[2], { debug = true }) end, -- default 140x32, panel ~57 cols
     post_case = teardown,
   },
 })
 
 for _, prompt in ipairs(PROMPT_POSITIONS) do
-  debug_set['file_info_panel_' .. prompt] = function()
+  debug_narrow_set['file_info_panel_' .. prompt] = function()
     open_picker(prompt, 'main')
-    -- Modified / Last Access timestamps drift between runs; ignore those text
-    -- rows but still verify everything else (panel layout, scores, attrs).
-    assert_snapshot_match({ ignore_text = { 13, 14 } })
+    assert_snapshot_match()
   end
 end
-T['debug'] = debug_set
+T['debug_narrow'] = debug_narrow_set
+
+local debug_wide_set = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup(LAYOUTS[4], { debug = true }) end, -- xwide 240x48, panel ~96 cols
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  debug_wide_set['file_info_panel_' .. prompt] = function()
+    open_picker(prompt, 'main')
+    assert_snapshot_match()
+  end
+end
+T['debug_wide'] = debug_wide_set
 
 T['combo'] = MiniTest.new_set({
   hooks = {

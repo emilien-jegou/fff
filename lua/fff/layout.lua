@@ -1,6 +1,7 @@
 local M = {}
 
 local utils = require('fff.utils')
+local file_info_renderer = require('fff.file_picker.file_info')
 
 local BORDER_PRESETS = {
   single = { '┌', '─', '┐', '│', '┘', '─', '└', '│' },
@@ -351,9 +352,14 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
       left = input_neighbour_preview_left and input_bottom_at_picker_bottom,
     }),
   }
-  local input_border = prompt_position == 'bottom'
-      and { ic.tl, border_chars[2], ic.tr, border_chars[4], ic.br, border_chars[6], ic.bl, border_chars[8] }
-    or { ic.tl, border_chars[2], ic.tr, border_chars[4], '', '', '', border_chars[8] }
+  -- Input always renders a full border. In top-prompt mode the bottom border
+  -- coincides with the list's top border row; the corner glyphs (`├` / `┤`)
+  -- are computed identically by both sides, but input is opened LAST so its
+  -- corners win the zindex tie at the column shared with file_info's left
+  -- vertical — without this, file_info's plain `│` would overdraw the
+  -- T-junction and leave a disconnected corner.
+  local input_border =
+    { ic.tl, border_chars[2], ic.tr, border_chars[4], ic.br, border_chars[6], ic.bl, border_chars[8] }
 
   local input_cfg = {
     relative = 'editor',
@@ -570,6 +576,17 @@ function M.compute(config, preview_user_enabled)
 
   local is_fullscreen = width >= terminal_width and height >= usable_height
 
+  -- Panel sits above preview, so its width matches preview width. Ask the
+  -- renderer how many rows it'll draw so we don't reserve a gap row.
+  local preview_width_predicted = preview_user_enabled and math.floor(width * preview_size_ratio) or 0
+  local file_info_height = 0
+  if debug_user_enabled then
+    file_info_height = file_info_renderer.calculate_required_height(
+      config.debug and config.debug.show_file_info,
+      preview_width_predicted
+    )
+  end
+
   local dim_cfg = {
     total_width = width,
     -- Top/bottom preview with prompt-top has a 2-row chrome over-subtraction in
@@ -585,12 +602,12 @@ function M.compute(config, preview_user_enabled)
     start_row = row,
     preview_position = preview_position,
     prompt_position = prompt_position,
-    debug_enabled = debug_user_enabled,
+    debug_enabled = debug_user_enabled and file_info_height > 0,
     preview_enabled = preview_user_enabled,
-    preview_width = preview_user_enabled and math.floor(width * preview_size_ratio) or 0,
+    preview_width = preview_width_predicted,
     preview_height = preview_user_enabled and math.floor(height * preview_size_ratio) or 0,
     separator_width = 3,
-    file_info_height = debug_user_enabled and 10 or 0,
+    file_info_height = file_info_height,
   }
 
   local layout = M.calculate_dimensions(dim_cfg)

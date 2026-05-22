@@ -3,8 +3,12 @@ local file_picker = require('fff.file_picker')
 local image = require('fff.file_picker.image')
 local location_utils = require('fff.location_utils')
 local rust = require('fff.rust')
+local file_info_renderer = require('fff.file_picker.file_info')
 
 local M = {}
+
+-- Namespace dedicated to the file info panel highlights.
+M.file_info_ns = vim.api.nvim_create_namespace('fff_file_info')
 
 -- Preview buffers are scratch buffers. Detect the file's language and attach
 -- highlighting directly, but keep buffer filetype empty to avoid ftplugin and
@@ -374,108 +378,6 @@ function M.get_file_info(file_path)
   return info
 end
 
---- Create file info content without custom borders
---- @param file table File information from search results
---- @param info table File system information
---- @param file_index number|nil Index of the file in search results (for score lookup)
---- @return table Lines for the file info content
-function M.create_file_info_content(file, info, file_index)
-  local lines = {}
-
-  local score = file_index and file_picker.get_file_score(file_index) or nil
-  table.insert(
-    lines,
-    string.format('Size: %-8s │ Total Score: %d', info.size_formatted or 'N/A', score and score.total or 0)
-  )
-  table.insert(
-    lines,
-    string.format('Type: %-8s │ Match Type: %s', info.filetype or 'text', score and score.match_type or 'unknown')
-  )
-  table.insert(
-    lines,
-    string.format(
-      'Git:  %-8s │ Frecency Mod: %d, Acc: %d',
-      file.git_status or 'clear',
-      file.modification_frecency_score or 0,
-      file.access_frecency_score or 0
-    )
-  )
-
-  if score then
-    table.insert(
-      lines,
-      string.format(
-        'Score Breakdown: base=%d, name_bonus=%d, special_bonus=%d',
-        score.base_score,
-        score.filename_bonus,
-        score.special_filename_bonus
-      )
-    )
-    table.insert(
-      lines,
-      string.format(
-        'Score Modifiers: frec_boost=%d, dist_penalty=%d, current_penalty=%d',
-        score.frecency_boost,
-        score.distance_penalty,
-        score.current_file_penalty or 0
-      )
-    )
-  else
-    table.insert(lines, 'Score Breakdown: N/A (no score data available)')
-  end
-  table.insert(lines, '')
-
-  -- Time information section
-  table.insert(lines, 'TIMINGS')
-  table.insert(lines, string.rep('─', 50))
-  table.insert(lines, string.format('Modified: %s', info.modified_formatted or 'N/A'))
-  table.insert(lines, string.format('Last Access: %s', info.accessed_formatted or 'N/A'))
-
-  return lines
-end
-
---- Create file info content for grep mode items.
---- Shows grep-specific metadata: match location, frecency, file info.
----@param item table Grep match item with file + match metadata
----@param info table File system information from get_file_info
----@return table Lines for the file info content
-function M.create_grep_file_info_content(item, info)
-  local lines = {}
-
-  -- Match location info
-  local match_count = item.match_ranges and #item.match_ranges or 0
-  table.insert(
-    lines,
-    string.format('Match: line %d, col %d │ Ranges: %d', item.line_number or 0, (item.col or 0) + 1, match_count)
-  )
-  table.insert(
-    lines,
-    string.format('Byte Offset: %-12d │ Size: %s', item.byte_offset or 0, info.size_formatted or 'N/A')
-  )
-  table.insert(lines, string.format('Type: %-8s │ Git: %s', info.filetype or 'text', item.git_status or 'clean'))
-
-  -- Fuzzy match score (only available in fuzzy grep mode)
-  if item.fuzzy_score then table.insert(lines, string.format('Fuzzy Score: %d', item.fuzzy_score)) end
-
-  -- Frecency info
-  local total = item.total_frecency_score or 0
-  local acc = item.access_frecency_score or 0
-  local mod = item.modification_frecency_score or 0
-  table.insert(lines, string.format('Frecency: total=%d, access=%d, modification=%d', total, acc, mod))
-
-  -- Ordering explanation
-  table.insert(lines, 'Order: files sorted by frecency desc, matches by line asc')
-  table.insert(lines, '')
-
-  -- Time information section
-  table.insert(lines, 'TIMINGS')
-  table.insert(lines, string.rep('─', 50))
-  table.insert(lines, string.format('Modified: %s', info.modified_formatted or 'N/A'))
-  table.insert(lines, string.format('Last Access: %s', info.accessed_formatted or 'N/A'))
-
-  return lines
-end
-
 --- Preview a regular file
 --- @param file_path string Path to the file
 --- @param bufnr number Buffer number for preview
@@ -788,12 +690,99 @@ end
 --- @param winid number Window ID for the preview
 function M.set_preview_window(winid) M.state.winid = winid end
 
+local function resolve_absolute_path(rel)
+  if not rel or rel == '' then return nil end
+  if rel:sub(1, 1) == '/' then return rel end
+  local base = require('fff.conf').get().base_path
+  if base and base ~= '' then return (base:sub(-1) == '/') and (base .. rel) or (base .. '/' .. rel) end
+  return vim.fn.fnamemodify(rel, ':p')
+end
+
+local function build_file_info_data(file, file_metadata, file_index)
+  local conf = require('fff.conf').get()
+  local is_grep = file.line_number ~= nil
+  local sections = (conf.debug and conf.debug.show_file_info)
+    or { file_info = true, score_breakdown = true, timings = true, full_path = true }
+
+  -- Grep matches don't have a per-file fuzzy score, so the breakdown would
+  -- be all "N/A". Skip it but keep the rest of the panel identical.
+  if is_grep then sections = vim.tbl_extend('force', sections, { score_breakdown = false }) end
+
+  local abs_path = resolve_absolute_path(file.relative_path)
+  local times_opened = 0
+  if abs_path then
+    local ok, n = pcall(rust.get_file_access_count, abs_path)
+    if ok and type(n) == 'number' then times_opened = n end
+  end
+
+  local file_view = {
+    relative_path = file.relative_path,
+    absolute_path = abs_path or file.absolute_path or file_metadata.path,
+    size_formatted = file_metadata.size_formatted,
+    filetype = file_metadata.filetype or 'text',
+    git_status = file.git_status or 'clean',
+    access_frecency_score = file.access_frecency_score or 0,
+    modification_frecency_score = file.modification_frecency_score or 0,
+    times_opened = times_opened,
+    modified_formatted = file_metadata.modified_formatted,
+    accessed_formatted = file_metadata.accessed_formatted,
+  }
+
+  local score = nil
+  if not is_grep and file_index then score = file_picker.get_file_score(file_index) end
+
+  return {
+    file = file_view,
+    score = score,
+    sections = sections,
+    hls = conf.hl,
+  }
+end
+
+local function apply_file_info_extmarks(bufnr, extmarks)
+  vim.api.nvim_buf_clear_namespace(bufnr, M.file_info_ns, 0, -1)
+  for _, m in ipairs(extmarks) do
+    local opts = {}
+    if m.hl_group then
+      opts.hl_group = m.hl_group
+      if m.end_col then opts.end_col = m.end_col end
+    end
+    if m.virt_text then
+      opts.virt_text = m.virt_text
+      opts.virt_text_pos = m.virt_text_pos or 'overlay'
+    end
+    pcall(vim.api.nvim_buf_set_extmark, bufnr, M.file_info_ns, m.row, m.col or 0, opts)
+  end
+end
+
+local function resize_file_info(file_info_win, target_h, preview_win)
+  if not (file_info_win and vim.api.nvim_win_is_valid(file_info_win)) then return end
+  local current_h = vim.api.nvim_win_get_height(file_info_win)
+  local delta = target_h - current_h
+  if delta == 0 then return end
+  pcall(vim.api.nvim_win_set_config, file_info_win, { height = target_h })
+  if preview_win and vim.api.nvim_win_is_valid(preview_win) then
+    local cfg = vim.api.nvim_win_get_config(preview_win)
+    if cfg.row and cfg.height then
+      local new_row = (type(cfg.row) == 'table' and cfg.row[false] or cfg.row) + delta
+      pcall(vim.api.nvim_win_set_config, preview_win, {
+        relative = cfg.relative or 'editor',
+        row = new_row,
+        col = cfg.col,
+        width = cfg.width,
+        height = math.max(3, cfg.height - delta),
+      })
+    end
+  end
+end
+
 --- Update file info buffer
---- @param file table File information from search results (or grep match item)
---- @param bufnr number Buffer number for file info
---- @param file_index number|nil Index of the file in search results (for score lookup, file mode only)
---- @return boolean Success status
-function M.update_file_info_buffer(file, bufnr, file_index)
+--- @param file table
+--- @param bufnr number
+--- @param file_index number|nil
+--- @param preview_win number|nil Preview window — shifted to keep flush with file_info
+--- @return boolean
+function M.update_file_info_buffer(file, bufnr, file_index, preview_win)
   if not file then
     set_buffer_lines(bufnr, { 'No file selected' })
     return false
@@ -805,24 +794,33 @@ function M.update_file_info_buffer(file, bufnr, file_index)
     return false
   end
 
-  -- Detect grep mode items by the presence of line_number (grep-specific field)
-  local file_info_lines
-  if file.line_number ~= nil then
-    file_info_lines = M.create_grep_file_info_content(file, info)
-  else
-    file_info_lines = M.create_file_info_content(file, info, file_index)
+  local width = 80
+  local target_win
+  local wins = vim.fn.win_findbuf(bufnr)
+  for _, win in ipairs(wins) do
+    if vim.api.nvim_win_is_valid(win) then
+      width = vim.api.nvim_win_get_width(win)
+      target_win = win
+      break
+    end
   end
-  set_buffer_lines(bufnr, file_info_lines)
+
+  local data = build_file_info_data(file, info, file_index)
+  data.width = width
+  local result = file_info_renderer.build(data)
+
+  set_buffer_lines(bufnr, result.lines)
+  apply_file_info_extmarks(bufnr, result.extmarks)
 
   vim.api.nvim_set_option_value('modifiable', false, { buf = bufnr })
   vim.api.nvim_set_option_value('readonly', true, { buf = bufnr })
   vim.api.nvim_set_option_value('buftype', 'nofile', { buf = bufnr })
 
-  -- Set wrap on the window (wrap is window-local, not buffer-local)
-  local wins = vim.fn.win_findbuf(bufnr)
   for _, win in ipairs(wins) do
     if vim.api.nvim_win_is_valid(win) then vim.api.nvim_set_option_value('wrap', false, { win = win }) end
   end
+
+  if result.height > 0 then resize_file_info(target_win, result.height, preview_win) end
 
   return true
 end

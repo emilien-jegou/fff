@@ -179,7 +179,16 @@ Defaults are sensible. Override only what you care about.
         modes = { 'plain', 'regex', 'fuzzy' },
         trim_whitespace = false,
       },
-      debug = { enabled = false, show_scores = false },
+      debug = {
+        enabled = false, -- show the file info panel next to the preview
+        show_scores = false, -- inline scores in the file list
+        show_file_info = {
+          file_info = true, -- size, type, git status, frecency
+          score_breakdown = true, -- total + match type, bonuses, modifiers, penalty
+          timings = true, -- modified + accessed timestamps
+          full_path = true, -- absolute path at the bottom (wraps if too long)
+        },
+      },
       logging = {
         enabled = true,
         log_file = vim.fn.stdpath('log') .. '/fff.log',

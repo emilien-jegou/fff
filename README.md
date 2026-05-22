@@ -266,7 +266,22 @@ require('fff').setup({
     modes = { 'plain', 'regex', 'fuzzy' },
     trim_whitespace = false,
   },
-  debug = { enabled = false, show_scores = false },
+  debug = {
+    enabled = false, -- show the file info panel next to the preview
+    show_scores = false, -- inline scores in the file list
+    -- Per-section toggles for the file info panel. Accepts a boolean shorthand
+    -- (`show_file_info = true|false`) to flip everything at once. The panel
+    -- adapts to width: narrow renders sections vertically, wide renders them
+    -- as a two-column grid. Disable a section to also shrink the panel.
+    show_file_info = {
+      file_info = true, -- size, type, git status, frecency
+      score_breakdown = true, -- total + match type, bonuses, modifiers, penalty
+      -- modified + accessed timestamps; pass a table to hide individual rows:
+      --   timings = { modified = false, accessed = true }
+      timings = true,
+      full_path = true, -- relative path at the bottom (wraps if too long)
+    },
+  },
   logging = {
     enabled = true,
     log_file = vim.fn.stdpath('log') .. '/fff.log',
@@ -310,6 +325,35 @@ Mix freely: `git:modified src/**/*.rs !src/**/mod.rs user controller`.
 ### Git status highlighting
 
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
+
+### Float colors
+
+The picker maps its float content to `NormalFloat` (via `hl.normal`) and the border to `FloatBorder`. Default `FloatBorder` links to `NormalFloat`, so border and content share a background out of the box and the picker reads as a single popup. Override `hl.normal = 'Normal'` to make the picker blend with the editor instead.
+
+### File info panel
+
+Enable with `debug.enabled = true`. The panel sits above the preview and shows
+file metadata, score breakdown, timestamps and the full absolute path. It
+adapts to the panel width: at narrow widths sections stack vertically (B2),
+at wide widths sections render as a two-column grid (H2). Each section can be
+disabled individually via `debug.show_file_info`.
+
+Customise the panel via `hl`:
+
+| key                          | default              | used for                            |
+| ---------------------------- | -------------------- | ----------------------------------- |
+| `file_info_section`          | `Title`              | section header label                |
+| `file_info_separator`        | `FloatBorder`        | dashes that act as section borders  |
+| `file_info_label`            | `Comment`            | row labels (Size, Type, Git, ...)   |
+| `file_info_value`            | `Normal` fg          | plain values                        |
+| `file_info_value_dim`        | `NonText`            | dim values, separators inside rows  |
+| `file_info_size`             | `Number`             | file size value                     |
+| `file_info_type`             | `Type`               | filetype value                      |
+| `file_info_path`             | `Directory`          | full path                           |
+| `file_info_total_score`      | bold + `Number`      | total score (bold)                  |
+| `file_info_match_type`       | bold + `Special`     | match type (bold)                   |
+| `file_info_score_pos`        | `DiagnosticOk`       | positive score components           |
+| `file_info_score_neg`        | `DiagnosticError`    | negative score components           |
 
 ### File filtering
 

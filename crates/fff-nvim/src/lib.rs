@@ -453,17 +453,18 @@ pub fn get_git_root(_: &Lua, _: ()) -> LuaResult<Option<String>> {
     Ok(picker.git_root().map(|p| p.to_string_lossy().into_owned()))
 }
 
-pub fn get_base_path(_: &Lua, _: ()) -> LuaResult<Option<String>> {
-    let file_picker = FILE_PICKER.read().into_lua_result()?;
-    let Some(ref picker) = *file_picker else {
-        return Ok(None);
-    };
-
-    Ok(Some(picker.base_path().to_string_lossy().into_owned()))
-}
-
 pub fn refresh_git_status(_: &Lua, _: ()) -> LuaResult<usize> {
     FILE_PICKER.refresh_git_status(&FRECENCY).into_lua_result()
+}
+
+pub fn get_file_access_count(_: &Lua, file_path: String) -> LuaResult<u64> {
+    let path = PathBuf::from(&file_path);
+    let frecency_guard = FRECENCY.read().into_lua_result()?;
+    let Some(ref frecency) = *frecency_guard else {
+        return Ok(0);
+    };
+    let count = frecency.access_count(&path).into_lua_result()?;
+    Ok(count as u64)
 }
 
 pub fn update_single_file_frecency(_: &Lua, file_path: String) -> LuaResult<bool> {
@@ -804,6 +805,10 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
     )?;
     exports.set("live_grep", lua.create_function(live_grep)?)?;
     exports.set("track_access", lua.create_function(track_access)?)?;
+    exports.set(
+        "get_file_access_count",
+        lua.create_function(get_file_access_count)?,
+    )?;
     exports.set("cancel_scan", lua.create_function(cancel_scan)?)?;
     exports.set("get_scan_progress", lua.create_function(get_scan_progress)?)?;
     exports.set(
@@ -811,7 +816,6 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
         lua.create_function(refresh_git_status)?,
     )?;
     exports.set("get_git_root", lua.create_function(get_git_root)?)?;
-    exports.set("get_base_path", lua.create_function(get_base_path)?)?;
     exports.set(
         "stop_background_monitor",
         lua.create_function(stop_background_monitor)?,

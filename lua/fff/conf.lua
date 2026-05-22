@@ -269,7 +269,7 @@ local function init()
     },
     hl = {
       border = 'FloatBorder',
-      normal = 'Normal',
+      normal = 'NormalFloat',
       matched = 'IncSearch',
       title = 'Title',
       prompt = 'Question',
@@ -311,6 +311,19 @@ local function init()
       grep_fuzzy_active = 'DiagnosticHint', -- Highlight for keybind + label when fuzzy is on
       -- Cross-mode suggestion highlights
       suggestion_header = 'WarningMsg', -- Highlight for the "No results found. Suggested..." banner
+      -- File info panel highlights
+      file_info_section = 'FFFFileInfoSection', -- Section header label (e.g. "file", "score")
+      file_info_separator = 'FFFFileInfoSeparator', -- Dash dividers used like a border
+      file_info_label = 'FFFFileInfoLabel', -- Row labels (Size, Type, Git, ...)
+      file_info_value = 'FFFFileInfoValue', -- Plain values
+      file_info_value_dim = 'FFFFileInfoValueDim', -- Tertiary values, separators inside rows
+      file_info_size = 'FFFFileInfoSize', -- File size value
+      file_info_type = 'FFFFileInfoType', -- Filetype value
+      file_info_path = 'FFFFileInfoPath', -- Full path value
+      file_info_total_score = 'FFFFileInfoTotalScore', -- Total score (bold)
+      file_info_match_type = 'FFFFileInfoMatchType', -- match_type label (bold)
+      file_info_score_pos = 'FFFFileInfoScorePos', -- Positive score components
+      file_info_score_neg = 'FFFFileInfoScoreNeg', -- Negative score components / penalties
     },
     -- Store file open frecency
     frecency = {
@@ -331,6 +344,15 @@ local function init()
     debug = {
       enabled = false, -- Show file info panel in preview
       show_scores = false, -- Show scores inline in the UI
+      show_file_info = {
+        file_info = true, -- Size, type, git status, frecency
+        score_breakdown = true, -- Total + match type, bonuses, modifiers, penalty
+        -- Modified + accessed timestamps. Pass a boolean to toggle the
+        -- whole section, or a table to hide individual rows:
+        --   timings = { modified = false, accessed = true }
+        timings = true,
+        full_path = true, -- Full absolute path at the bottom
+      },
     },
     logging = {
       enabled = true,
@@ -354,6 +376,24 @@ local function init()
 
   local migrated_user_config = handle_deprecated_config(config)
   local merged_config = vim.tbl_deep_extend('force', default_config, migrated_user_config)
+
+  -- Normalise show_file_info: accept a boolean shorthand or a partial table
+  local sfi = merged_config.debug and merged_config.debug.show_file_info
+  local default_sections = { file_info = true, score_breakdown = true, timings = true, full_path = true }
+  if type(sfi) == 'boolean' then
+    merged_config.debug.show_file_info = {
+      file_info = sfi,
+      score_breakdown = sfi,
+      timings = sfi,
+      full_path = sfi,
+    }
+  elseif type(sfi) == 'table' then
+    for k, v in pairs(default_sections) do
+      if sfi[k] == nil then sfi[k] = v end
+    end
+  else
+    merged_config.debug.show_file_info = default_sections
+  end
 
   state.config = merged_config
 end

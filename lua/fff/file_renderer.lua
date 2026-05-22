@@ -73,7 +73,7 @@ end
 --- @param line_content string The actual line content
 function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_content)
   local icons = require('fff.file_picker.icons')
-  local git_utils = require('fff.git_utils')
+  local highlights = require('fff.highlights')
   local file_picker = require('fff.file_picker')
 
   local is_cursor = (ctx.cursor == item_idx)
@@ -111,7 +111,7 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
 
   -- 3. Git text color (filename)
   if ctx.config.git and ctx.config.git.status_text_color and icon and #filename > 0 then
-    local git_text_hl = item.git_status and git_utils.get_text_highlight(item.git_status) or nil
+    local git_text_hl = item.git_status and highlights.get_git_text_highlight(item.git_status) or nil
     if git_text_hl and git_text_hl ~= '' and not is_current_file then
       local filename_start = #icon + 1
       vim.api.nvim_buf_set_extmark(
@@ -169,44 +169,9 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
   end
 
   -- 7. Git sign
-  if item.git_status and git_utils.should_show_border(item.git_status) then
-    local border_char = git_utils.get_border_char(item.git_status)
-    local border_hl
-
-    if is_cursor then
-      local base_hl = git_utils.get_border_highlight_selected(item.git_status)
-      if base_hl and base_hl ~= '' then
-        local base_id = vim.fn.synIDtrans(vim.fn.hlID(base_hl))
-        local cursor_id = vim.fn.synIDtrans(vim.fn.hlID(ctx.config.hl.cursor))
-        local border_fg_gui = vim.fn.synIDattr(base_id, 'fg', 'gui')
-        local border_fg_cterm = vim.fn.synIDattr(base_id, 'fg', 'cterm')
-        local cursor_bg_gui = vim.fn.synIDattr(cursor_id, 'bg', 'gui')
-        local cursor_bg_cterm = vim.fn.synIDattr(cursor_id, 'bg', 'cterm')
-        local has_gui = border_fg_gui ~= '' and cursor_bg_gui ~= ''
-        local has_cterm = border_fg_cterm ~= '' and cursor_bg_cterm ~= ''
-
-        if has_gui or has_cterm then
-          local temp_hl_name = 'FFFGitBorderSelected_' .. item_idx
-          local hl_opts = {}
-          if has_gui then
-            hl_opts.fg = border_fg_gui
-            hl_opts.bg = cursor_bg_gui
-          end
-          if has_cterm then
-            hl_opts.ctermfg = tonumber(border_fg_cterm)
-            hl_opts.ctermbg = tonumber(cursor_bg_cterm)
-          end
-          vim.api.nvim_set_hl(0, temp_hl_name, hl_opts)
-          border_hl = temp_hl_name
-        else
-          border_hl = git_utils.get_border_highlight_selected(item.git_status)
-        end
-      else
-        border_hl = ctx.config.hl.cursor
-      end
-    else
-      border_hl = git_utils.get_border_highlight(item.git_status)
-    end
+  if item.git_status and highlights.should_show_git_border(item.git_status) then
+    local border_char = highlights.get_git_border_char(item.git_status)
+    local border_hl = highlights.get_git_sign_highlight(item.git_status, is_cursor, ctx.config.hl.cursor)
 
     if border_hl and border_hl ~= '' then
       vim.api.nvim_buf_set_extmark(buf, ns_id, line_idx - 1, 0, {

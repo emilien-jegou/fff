@@ -9,6 +9,11 @@ INCLUDEDIR ?= $(PREFIX)/include
 STRESS_RUSTFLAGS := --cfg stress
 FFF_STRESS_DEFAULT_SEED ?= 0xDEADBEEFCAFEBABE
 
+SHELL := bash
+# Order matters: `-c` must be last so bash treats the recipe as the script
+# string rather than the literal `-o` / `pipefail` tokens.
+.SHELLFLAGS := -o pipefail -ec
+
 .PHONY: build build-c-lib install uninstall test test-rust test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos
 
 all: format test lint
@@ -64,12 +69,15 @@ test-rust:
 	cargo test --workspace --features zlob --exclude fff-nvim
 
 # neovim instance swallows internal crashes and doesn't rise the the error exiting silently
-# so check the stdout in case the sigsegv coming out of fff was printed (actual regression)
+# so check the stdout in case the sigsegv coming out of fff was printed (actual regression).
+# Output is streamed live via `tee`; pipefail (set above) propagates nvim's exit.
 test-lua: test-setup build
-	@output=$$(nvim --headless -u tests/minimal_init.lua \
-		-c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}" 2>&1); \
-	echo "$$output"; \
-	if echo "$$output" | grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)"; then \
+	@logfile=$$(mktemp); \
+	trap 'rm -f "$$logfile"' EXIT; \
+	nvim --headless -u tests/minimal_init.lua \
+		-c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}" 2>&1 \
+		| tee "$$logfile"; \
+	if grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)" "$$logfile"; then \
 		echo ""; \
 		echo "FAIL: native crash detected during lua tests"; \
 		exit 1; \
@@ -77,12 +85,18 @@ test-lua: test-setup build
 
 # mini.test reference_screenshot snapshots. Separate runner because mini.test
 # spawns child processes and uses its own collector (incompatible with
-# PlenaryBustedDirectory).
+# PlenaryBustedDirectory). Streams output live via `tee` so failure diffs
+# appear as they happen instead of after a long capture-buffered silence.
+# `pcall` catches collect-time errors (e.g. parse error in the test file)
+# that would otherwise leave headless nvim hanging in its event loop because
+# the reporter's `cquit` never fires.
 test-lua-snap: test-setup build
-	@output=$$(nvim --headless -u tests/minimal_init.lua \
-		-c "lua require('mini.test').run_file('tests/picker_ui_snap.lua')" 2>&1); \
-	echo "$$output"; \
-	if echo "$$output" | grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)"; then \
+	@logfile=$$(mktemp); \
+	trap 'rm -f "$$logfile"' EXIT; \
+	nvim --headless -u tests/minimal_init.lua \
+		-c "lua local ok,err=pcall(require('mini.test').run_file,'tests/picker_ui_snap.lua'); if not ok then io.stderr:write('mini.test failed to load: '..tostring(err)..'\\n'); vim.cmd('cquit 2') end" 2>&1 \
+		| tee "$$logfile"; \
+	if grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)" "$$logfile"; then \
 		echo ""; \
 		echo "FAIL: native crash detected during snapshot tests"; \
 		exit 1; \
@@ -94,17 +108,15 @@ test-version: test-setup
 
 prepare-bun: build
 	mkdir -p packages/fff-bun/bin
-	cp target/release/libfff_c.dylib packages/fff-bun/bin/ 2>/dev/null; \
-	cp target/release/libfff_c.so packages/fff-bun/bin/ 2>/dev/null; \
-	cp target/release/fff_c.dll packages/fff-bun/bin/ 2>/dev/null; \
-	true
+	cp target/release/libfff_c.dylib packages/fff-bun/bin/ 2>/dev/null || true; \
+	cp target/release/libfff_c.so packages/fff-bun/bin/ 2>/dev/null || true; \
+	cp target/release/fff_c.dll packages/fff-bun/bin/ 2>/dev/null || true
 
 prepare-node: build
 	mkdir -p packages/fff-node/bin
-	cp target/release/libfff_c.dylib packages/fff-node/bin/ 2>/dev/null; \
-	cp target/release/libfff_c.so packages/fff-node/bin/ 2>/dev/null; \
-	cp target/release/fff_c.dll packages/fff-node/bin/ 2>/dev/null; \
-	true
+	cp target/release/libfff_c.dylib packages/fff-node/bin/ 2>/dev/null || true; \
+	cp target/release/libfff_c.so packages/fff-node/bin/ 2>/dev/null || true; \
+	cp target/release/fff_c.dll packages/fff-node/bin/ 2>/dev/null || true
 
 test-bun: prepare-bun
 	cd packages/fff-bun && bun test src/

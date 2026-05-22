@@ -1409,7 +1409,7 @@ function M.update_preview()
   M.update_preview_title(item, effective_location)
 
   if M.state.file_info_buf then
-    preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor)
+    preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor, M.state.preview_win)
     if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) then
       local rel = item.relative_path or item.path or ''
       pcall(vim.api.nvim_win_set_config, M.state.file_info_win, { title = ' ' .. rel .. ' ', title_pos = 'left' })
@@ -1432,19 +1432,9 @@ function M.clear_preview()
 
   if M.state.file_info_buf then
     vim.api.nvim_set_option_value('modifiable', true, { buf = M.state.file_info_buf })
-    vim.api.nvim_buf_set_lines(M.state.file_info_buf, 0, -1, false, {
-      'File Info Panel',
-      '',
-      'Select a file to view:',
-      '• Comprehensive scoring details',
-      '• File size and type information',
-      '• Git status integration',
-      '• Modification & access timings',
-      '• Frecency scoring breakdown',
-      '',
-      'Navigate: ↑↓ or Ctrl+p/n',
-    })
+    vim.api.nvim_buf_set_lines(M.state.file_info_buf, 0, -1, false, {})
     vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.file_info_buf })
+    pcall(vim.api.nvim_buf_clear_namespace, M.state.file_info_buf, preview.file_info_ns, 0, -1)
   end
 
   vim.api.nvim_set_option_value('modifiable', true, { buf = M.state.preview_buf })

@@ -21,6 +21,7 @@ M.scan_files = rust_module.scan_files
 M.get_cached_files = rust_module.get_cached_files
 M.fuzzy_search_files = rust_module.fuzzy_search_files
 M.track_access = rust_module.track_access
+M.get_file_access_count = rust_module.get_file_access_count
 M.add_file = rust_module.add_file
 M.remove_file = rust_module.remove_file
 M.cancel_scan = rust_module.cancel_scan

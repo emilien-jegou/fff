@@ -149,8 +149,14 @@ M.ensure_initialized = function()
   state.file_picker_initialized = true
   setup_global_autocmds(config)
 
-  local git_utils = require('fff.git_utils')
-  git_utils.setup_highlights()
+  local highlights = require('fff.highlights')
+  highlights.setup()
+
+  vim.api.nvim_create_autocmd('ColorScheme', {
+    group = vim.api.nvim_create_augroup('fff_highlights', { clear = true }),
+    callback = function() highlights.setup() end,
+    desc = 'Re-apply FFF highlights on colorscheme change',
+  })
 
   return fuzzy
 end
