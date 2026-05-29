@@ -131,6 +131,10 @@ describe('picker find_files_in_dir path resolution (issue #389)', function()
 
     picker_ui.select('edit')
 
+    -- select('edit') defers the actual :edit via vim.schedule (see picker_ui.lua)
+    -- to let picker float teardown finish before opening the file. Flush here.
+    vim.wait(2000, function() return vim.api.nvim_buf_get_name(0) ~= '' end)
+
     local bufname = vim.api.nvim_buf_get_name(0)
     assert.is_true(bufname ~= '', 'expected :edit to open a buffer with a non-empty name')
 

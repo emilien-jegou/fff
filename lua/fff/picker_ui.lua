@@ -2080,39 +2080,40 @@ function M.select(action)
   vim.cmd('stopinsert')
   M.close()
 
-  if action == 'edit' then
-    local current_win = vim.api.nvim_get_current_win()
-    local current_buf = vim.api.nvim_get_current_buf()
-    local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
-    local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
-    local current_winfixbuf = window_has_winfixbuf(current_win)
+  -- Defer file open past picker float teardown. Without this, foldexpr is not
+  -- recomputed on the new window (folds appear missing) on some platforms.
+  vim.schedule(function()
+    if action == 'edit' then
+      local current_win = vim.api.nvim_get_current_win()
+      local current_buf = vim.api.nvim_get_current_buf()
+      local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
+      local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
+      local current_winfixbuf = window_has_winfixbuf(current_win)
 
-    -- If the current window can't host a new buffer (special buftype, non-modifiable,
-    -- or 'winfixbuf' locking it), retarget a suitable window or fall back to a split.
-    -- Without this, :edit raises E1513 ("Cannot switch buffer. 'winfixbuf' is enabled")
-    -- whenever the picker is invoked from a window pinned via :h winfixbuf.
-    local opened_via_split = false
-    if current_buftype ~= '' or not current_buf_modifiable or current_winfixbuf then
-      local suitable_win = find_suitable_window()
-      if suitable_win then
-        vim.api.nvim_set_current_win(suitable_win)
-      elseif current_winfixbuf then
-        vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-        opened_via_split = true
+      -- If the current window can't host a new buffer (special buftype, non-modifiable,
+      -- or 'winfixbuf' locking it), retarget a suitable window or fall back to a split.
+      -- Without this, :edit raises E1513 ("Cannot switch buffer. 'winfixbuf' is enabled")
+      -- whenever the picker is invoked from a window pinned via :h winfixbuf.
+      local opened_via_split = false
+      if current_buftype ~= '' or not current_buf_modifiable or current_winfixbuf then
+        local suitable_win = find_suitable_window()
+        if suitable_win then
+          vim.api.nvim_set_current_win(suitable_win)
+        elseif current_winfixbuf then
+          vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+          opened_via_split = true
+        end
       end
+
+      if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
+    elseif action == 'split' then
+      vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+    elseif action == 'vsplit' then
+      vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
+    elseif action == 'tab' then
+      vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
     end
 
-    if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
-  elseif action == 'split' then
-    vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-  elseif action == 'vsplit' then
-    vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
-  elseif action == 'tab' then
-    vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
-  end
-
-  -- Derive side effects on vim schedule to ensure they run after the file is opened
-  vim.schedule(function()
     if location then location_utils.jump_to_location(location) end
 
     if query and query ~= '' then
