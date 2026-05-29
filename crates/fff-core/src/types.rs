@@ -597,13 +597,7 @@ impl FileItem {
 
     /// Returns a reference to a cached mmap of the file's contents.
     ///
-    /// SAFETY-CRITICAL: callers must hold the picker read lock for as long as
-    /// the returned slice is in use. The watcher mutates `FileItem` (including
-    /// `invalidate_mmap`) under the picker write lock, so the read lock is
-    /// what prevents UAF (`OnceLock` reset → `munmap`) and SIGBUS (in-place
-    /// truncate → access past new EOF). Detached background tasks (e.g. the
-    /// bigram builder running on `BACKGROUND_THREAD_POOL`) MUST NOT call this
-    /// — use `read_trimmed_into_buf` instead.
+    /// SAFETY-CRITICAL: callers must hold the picker read lock for as long as the returned slice is in use.
     #[cfg(not(target_os = "windows"))]
     pub(crate) fn get_cached_content(
         &self,
@@ -615,10 +609,6 @@ impl FileItem {
             return Some(content);
         }
 
-        // Skip caching when mmap can't pay for itself. Files under one page
-        // worth of bytes waste kernel VM structures and a per-file syscall
-        // pair — the chunked `read_into_buf` fallback is cheaper for them
-        // and hits the OS page cache on repeat reads anyway.
         if self.size < MMAP_THRESHOLD || self.size > budget.max_file_size {
             return None;
         }
@@ -654,16 +644,20 @@ impl FileItem {
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
-        buf: &'a mut Vec<u8>, // we allow it to grow
+        buf: &'a mut Vec<u8>,
+        #[cfg_attr(target_os = "windows", allow(unused_variables))] mmap_slot: &'a mut MmapSlot,
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
     ) -> Option<&'a [u8]> {
-        // Fast path: persistent cache hit (zero-copy). Safe here because grep
-        // callers hold the picker read lock for the lifetime of the returned
-        // slice — see [`Self::get_cached_content`] safety note.
-        if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
-            return Some(cached);
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Fast path: persistent cache hit (zero-copy). Safe here because
+            // grep callers hold the picker read lock for the lifetime of the
+            // returned slice — see [`Self::get_cached_content`] safety note.
+            if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
+                return Some(cached);
+            }
         }
 
         let max_file_size = budget.max_file_size;
@@ -671,26 +665,50 @@ impl FileItem {
             return None;
         }
 
-        // Slow path: read into the reusable buffer — open() + read_exact() + close().
-        // No mmap()/munmap() syscalls, no page table setup/teardown.
-        // We know the exact size so we use read_exact (1 read syscall) instead of
-        // read_to_end (2 read syscalls — one for data, one for EOF confirmation).
         let abs = self.absolute_path(arena, base_path);
+
+        #[cfg(not(target_os = "windows"))]
+        if self.size >= FRESH_MMAP_THRESHOLD {
+            let file = std::fs::File::open(&abs).ok()?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+            let stored = mmap_slot.insert(mmap);
+            return Some(&stored[..]);
+        } else {
+            let _ = (mmap_slot, arena);
+        }
+
         let len = self.size as usize;
         buf.resize(len, 0);
+
         let mut file = std::fs::File::open(&abs).ok()?;
         file.read_exact(buf).ok()?;
         Some(buf.as_slice())
     }
 }
 
-/// Files smaller than one page waste the remainder when mmapped.
-/// Files smaller than one page waste the remainder when mmapped. Unused
-/// on Windows where the persistent content cache is disabled.
 #[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 const MMAP_THRESHOLD: u64 = 16 * 1024;
 #[cfg(all(not(target_os = "windows"), not(target_arch = "aarch64")))]
 const MMAP_THRESHOLD: u64 = 4 * 1024;
+
+// these are empirically set values for the benchmarks. Theory is simple:
+// the larger the file is - the more syscalls needed to read the file, so at some
+// point it becomes better strategy to mmap file and process instead of doing chunking
+#[cfg(target_os = "macos")]
+pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 1024 * 1024;
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 0;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) const FRESH_MMAP_THRESHOLD: u64 = 256 * 1024;
+
+/// Per-thread scratch slot owning a transient mmap returned from
+/// [`FileItem::get_content_for_search`]. `Option<Mmap>` on Unix,
+/// unit on Windows where mmap is unused.
+#[cfg(not(target_os = "windows"))]
+pub type MmapSlot = Option<memmap2::Mmap>;
+#[cfg(target_os = "windows")]
+pub type MmapSlot = ();
 
 impl Constrainable for FileItem {
     #[inline]
