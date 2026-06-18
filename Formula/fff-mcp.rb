@@ -4,7 +4,7 @@ class FffMcp < Formula
   desc "Fast file search toolkit for AI agents (MCP server)"
   homepage "https://github.com/dmtrKovalenko/fff.nvim"
   license "MIT"
-  version "0.9.4"
+  version "0.9.5"
 
   LIVECHECK_REPO = "dmtrKovalenko/fff.nvim".freeze
   RELEASE_BASE = "https://github.com/dmtrKovalenko/fff.nvim/releases/download".freeze
@@ -12,24 +12,24 @@ class FffMcp < Formula
   on_macos do
     on_arm do
       url "#{RELEASE_BASE}/v#{version}/fff-mcp-aarch64-apple-darwin"
-      sha256 "90a7007d378583531cb3ca03037303ce0bd1ec7b31ca86a5b90d5683440df5b3"
+      sha256 "5e46ffd613a71cb460fb674a0756070658e806b10f6151f8ffd006ddddd8dccf"
     end
 
     on_intel do
       url "#{RELEASE_BASE}/v#{version}/fff-mcp-x86_64-apple-darwin"
-      sha256 "20a91c0421ac05b9d32f0349ff147e5d0ad118ce6cd8a831ba9a873d98676cfd"
+      sha256 "66b717a9dd0a058972042f6a20bbf51274df1b8cdb4b6c5586c0d8a7b0fc0d3a"
     end
   end
 
   on_linux do
     on_arm do
       url "#{RELEASE_BASE}/v#{version}/fff-mcp-aarch64-unknown-linux-gnu"
-      sha256 "9d942894be613901ddea645337dcdd47e30ef78bf5a80530e01fe9b25b56c925"
+      sha256 "3f7b5306c79f099f8c18720a5f88e1c503ebaa11553758a230270727adf5bd13"
     end
 
     on_intel do
       url "#{RELEASE_BASE}/v#{version}/fff-mcp-x86_64-unknown-linux-gnu"
-      sha256 "b5dfc5b3c17cb35b681022a2b318ebc4e280d7c8c9b517177befdb79a31d6ec3"
+      sha256 "0bceb87752cb38540dbad585cd08fab3d26a315576bbf5af8b0d3c9c9ddf068b"
     end
   end
 
