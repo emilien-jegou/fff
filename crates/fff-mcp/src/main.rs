@@ -149,6 +149,11 @@ pub(crate) struct Args {
     #[arg(long = "max-cached-files", env = "FFF_MAX_CACHED_FILES")]
     max_cached_files: Option<usize>,
 
+    /// Follow symlinks during scan and watcher walks. Off by default —
+    /// enabling on cyclic symlink layouts can wedge the watcher.
+    #[arg(long = "follow-symlinks")]
+    follow_symlinks: bool,
+
     /// Run a health check and print diagnostic information, then exit.
     #[arg(long = "healthcheck")]
     pub(crate) healthcheck: bool,
@@ -270,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_budget: args
                 .max_cached_files
                 .map(fff::ContentCacheBudget::new_for_repo),
-            follow_symlinks: false,
+            follow_symlinks: args.follow_symlinks,
             ..Default::default()
         },
     )
