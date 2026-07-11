@@ -48,15 +48,12 @@ function M.render_line(item, ctx, item_idx) -- luacheck: ignore item_idx
     end
   end
 
-  -- Format filename and path
-  -- Don't reserve space for frecency - path takes priority
-  local icon_width = icon and (vim.fn.strdisplaywidth(icon) + 1) or 0
-  local available_width = math.max(ctx.max_path_width - icon_width, 40)
-  local filename, dir_path = ctx.format_file_display(item, available_width)
+  -- Use the full relative path instead of splitting filename and directory
+  local path_display = item.relative_path
 
   -- Build line
-  local line = icon and string.format('%s %s %s%s', icon, filename, dir_path, frecency)
-    or string.format('%s %s%s', filename, dir_path, frecency)
+  local line = icon and string.format('%s %s%s', icon, path_display, frecency)
+    or string.format('%s%s', path_display, frecency)
 
   local padding = math.max(0, ctx.win_width - vim.fn.strdisplaywidth(line) + 5)
   table.insert(lines, line .. string.rep(' ', padding))
@@ -81,11 +78,19 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
   local score = file_picker.get_file_score(item_idx)
   local is_current_file = score and score.current_file_penalty and score.current_file_penalty < 0
 
-  -- Get icon and paths
+  -- Get icon and full path
   local icon, icon_hl_group = icons.get_icon(item.name, item.extension, false)
-  local icon_width = icon and (vim.fn.strdisplaywidth(icon) + 1) or 0
-  local available_width = math.max(ctx.max_path_width - icon_width, 40)
-  local filename, dir_path = ctx.format_file_display(item, available_width)
+  local path_display = item.relative_path
+
+  -- Calculate string byte offsets for highlighting
+  local prefix_len = 0
+  if icon then
+    prefix_len = #icon + 1 -- Icon bytes + 1 space
+  end
+  
+  -- Directory length is the full path minus the filename itself
+  local dir_len = #path_display - #item.name
+  local filename_start = prefix_len + dir_len
 
   -- 1. Cursor highlight
   if is_cursor then
@@ -110,17 +115,16 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
     )
   end
 
-  -- 3. Git text color (filename)
-  if ctx.config.git and ctx.config.git.status_text_color and icon and #filename > 0 then
+  -- 3. Git text color (Applied ONLY to the filename part at the end)
+  if ctx.config.git and ctx.config.git.status_text_color and #item.name > 0 then
     local git_text_hl = item.git_status and highlights.get_git_text_highlight(item.git_status) or nil
     if git_text_hl and git_text_hl ~= '' and not is_current_file then
-      local filename_start = #icon + 1
       vim.api.nvim_buf_set_extmark(
         buf,
         ns_id,
         line_idx - 1,
         filename_start,
-        { end_col = filename_start + #filename, hl_group = git_text_hl }
+        { end_col = filename_start + #item.name, hl_group = git_text_hl }
       )
     end
   end
@@ -139,18 +143,14 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
     end
   end
 
-  -- 5. Directory path (dimmed)
-  if #filename > 0 and #dir_path > 0 then
-    local prefix_len = #filename + 1 -- filename bytes + space
-    if icon then
-      prefix_len = prefix_len + #icon + 1 -- if icon add icon bytes + space
-    end
+  -- 5. Directory path (Changed to 'Directory' to inherit the theme's blue folder color)
+  if dir_len > 0 then
     vim.api.nvim_buf_set_extmark(
       buf,
       ns_id,
       line_idx - 1,
       prefix_len,
-      { end_col = prefix_len + #dir_path, hl_group = ctx.config.hl.directory_path }
+      { end_col = filename_start, hl_group = 'Directory' }
     )
   end
 
