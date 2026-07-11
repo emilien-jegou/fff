@@ -16,6 +16,107 @@ function M.init(parent_module) P = parent_module end
 -- Convenience alias
 local S = picker_ui_state.state
 
+local function make_editor_relative(win_configs, preview_visible)
+  if not win_configs or not next(win_configs) then return end
+  
+  local editor_width = vim.o.columns
+  local editor_height = vim.o.lines
+  
+  -- Resolve prompt position dynamically
+  local prompt_position = 'top'
+  local picker_ui_state = require('fff.picker_ui.picker_ui_state')
+  local S = picker_ui_state.state
+  if S.config and S.config.layout and S.config.layout.prompt_position then
+    local pos = S.config.layout.prompt_position
+    if type(pos) == 'function' then pos = pos() end
+    if pos == 'top' or pos == 'bottom' then prompt_position = pos end
+  end
+
+  local has_preview = (preview_visible == true)
+  local prompt_height = 1
+  local content_height = editor_height - prompt_height
+  
+  local prompt_row, content_row
+  if prompt_position == 'bottom' then
+    prompt_row = editor_height - 1
+    content_row = 0
+  else -- 'top'
+    prompt_row = 0
+    content_row = 1
+  end
+
+  -- Apply base configuration options
+  local function apply_base_cfg(win_cfg)
+    win_cfg.relative = 'editor'
+    win_cfg.win = nil
+    win_cfg.border = 'none'
+    win_cfg.zindex = 250
+  end
+
+  -- 1. Configure Input (Prompt Window)
+  if win_configs.input then
+    win_configs.input.row = prompt_row
+    win_configs.input.col = 0
+    win_configs.input.width = editor_width
+    win_configs.input.height = prompt_height
+    apply_base_cfg(win_configs.input)
+  end
+
+  -- 2. Calculate Width Division for List and Preview Windows
+  local list_width = editor_width
+  local preview_width = 0
+  local list_col = 0
+  local preview_col = 0
+
+  if has_preview and win_configs.list and win_configs.preview then
+    local orig_list_w = win_configs.list.width or 1
+    local orig_prev_w = win_configs.preview.width or 1
+    local total_orig_w = orig_list_w + orig_prev_w
+    
+    local list_ratio = orig_list_w / total_orig_w
+    list_width = math.floor(editor_width * list_ratio)
+    preview_width = editor_width - list_width
+
+    -- Determine side alignments based on original configuration
+    local orig_list_col = win_configs.list.col or 0
+    local orig_prev_col = win_configs.preview.col or 0
+    if orig_prev_col < orig_list_col then
+      preview_col = 0
+      list_col = preview_width
+    else
+      list_col = 0
+      preview_col = list_width
+    end
+  end
+
+  -- 3. Configure List Window
+  if win_configs.list then
+    win_configs.list.row = content_row
+    win_configs.list.col = list_col
+    win_configs.list.width = list_width
+    win_configs.list.height = content_height
+    apply_base_cfg(win_configs.list)
+  end
+
+  -- 4. Configure Preview Window
+  if has_preview and win_configs.preview then
+    win_configs.preview.row = content_row
+    win_configs.preview.col = preview_col
+    win_configs.preview.width = preview_width
+    win_configs.preview.height = content_height
+    apply_base_cfg(win_configs.preview)
+  end
+
+  -- 5. Configure File Info Overlay (if used)
+  if win_configs.file_info then
+    win_configs.file_info.row = content_row
+    win_configs.file_info.col = list_col
+    win_configs.file_info.width = list_width
+    win_configs.file_info.height = content_height
+    apply_base_cfg(win_configs.file_info)
+  end
+end
+
 local function resolve_winhl(kind)
   local hl = S.config.hl
   local winhl = hl.winhl
@@ -154,7 +255,6 @@ function M.create_ui()
   local config = S.config
   if not config then return false end
 
-  -- Prompt editing should behave consistently even if the user has :set paste.
   S.restore_paste = (function()
     if not vim.o.paste then return false end
     vim.o.paste = false
@@ -168,6 +268,9 @@ function M.create_ui()
 
   local computed_layout = layout.compute(config, conf.preview_enabled(config))
   local win_configs = computed_layout.win_configs
+  -- Pass computed_layout.preview_visible to the adapter
+  make_editor_relative(win_configs, computed_layout.preview_visible)
+
   local debug_enabled_in_preview = computed_layout.debug_enabled
 
   S.layout = computed_layout.layout

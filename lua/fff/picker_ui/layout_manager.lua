@@ -27,6 +27,9 @@ function M.relayout()
 
   local computed_layout = layout.compute(config, conf.preview_enabled(config))
   local win_configs = computed_layout.win_configs
+  
+  make_editor_relative(win_configs, computed_layout.preview_visible)
+
   S.layout = computed_layout.layout
   S.preview_visible = computed_layout.preview_visible
 

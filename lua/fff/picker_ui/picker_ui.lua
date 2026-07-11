@@ -20,7 +20,15 @@ local canonicalize_fff_path = utils.canonicalize_fff_path
 local preview_config = conf.get().preview
 if preview_config then preview.setup(preview_config) end
 
-local function get_prompt_position() return layout.resolve_prompt_position(M.state.config) end
+local function get_prompt_position()
+  local config = M.state.config
+  if config and config.layout and config.layout.prompt_position then
+    local pos = config.layout.prompt_position
+    if type(pos) == 'function' then pos = pos() end
+    if pos == 'top' or pos == 'bottom' then return pos end
+  end
+  return layout.resolve_prompt_position(M.state.config)
+end
 
 -- Wire state from picker_ui_state module
 M.state = picker_ui_state.state

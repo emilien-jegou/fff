@@ -13,7 +13,15 @@ function M.init(parent_module) P = parent_module end
 
 local S = picker_ui_state.state
 
-local function get_prompt_position() return layout.resolve_prompt_position(S.config) end
+local function get_prompt_position()
+  local config = S.config
+  if config and config.layout and config.layout.prompt_position then
+    local pos = config.layout.prompt_position
+    if type(pos) == 'function' then pos = pos() end
+    if pos == 'top' or pos == 'bottom' then return pos end
+  end
+  return layout.resolve_prompt_position(S.config)
+end
 
 --- After cursor moves, decide whether the combo separator should hide.
 local function maybe_hide_combo_separator()
