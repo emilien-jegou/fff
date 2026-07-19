@@ -117,6 +117,12 @@ pub(super) fn fuzzy_grep_search<'a>(
     // if we have a few candidates -> likely we have a lot of matches, so verify the check faster
     // if we have a lot of candidates -> rely on a larger chunk pipelining more parallel lines at once
     let page_limit = options.page_limit;
+
+    // Collect a larger pool of matches in fuzzy mode so we can sort them by match quality
+    // and prevent highly active files with low-quality subsequence matches from drowing out
+    // high-quality matches in less active files.
+    let max_collect = page_limit.saturating_mul(20).max(1000);
+
     let base_chunk = rayon::current_num_threads() * 4;
     let prefilter_strong = total_files > 0 && files_to_search.len() * 2 < total_files;
     let max_chunk = if prefilter_strong {
@@ -342,17 +348,67 @@ pub(super) fn fuzzy_grep_search<'a>(
             per_file_results.push(result);
         }
 
-        if running_matches >= page_limit || budget_exceeded.load(Ordering::Relaxed) {
+        if running_matches >= max_collect || budget_exceeded.load(Ordering::Relaxed) {
             break;
         }
     }
 
-    GrepResult::collect(
+    let mut result = GrepResult::collect(
         per_file_results,
         files_to_search.len(),
         options,
         total_files,
         filtered_file_count,
         budget_exceeded.load(Ordering::Relaxed),
-    )
+    );
+
+    // Sort matches globally by their alignment quality (fuzzy_score) descending.
+    // Use historical file frecency and modification time as tie-breakers.
+    result.matches.sort_unstable_by(|a, b| {
+        let score_a = a.fuzzy_score.unwrap_or(0);
+        let score_b = b.fuzzy_score.unwrap_or(0);
+
+        score_b
+            .cmp(&score_a)
+            .then_with(|| {
+                let file_a = result.files[a.file_index];
+                let file_b = result.files[b.file_index];
+                file_b
+                    .total_frecency_score()
+                    .cmp(&file_a.total_frecency_score())
+            })
+            .then_with(|| {
+                let file_a = result.files[a.file_index];
+                let file_b = result.files[b.file_index];
+                file_b.modified.cmp(&file_a.modified)
+            })
+            .then_with(|| a.line_number.cmp(&b.line_number))
+    });
+
+    // Truncate results to the requested limit, and prune unused files
+    // from the referenced files list to maintain index mapping integrity.
+    if result.matches.len() > page_limit {
+        result.matches.truncate(page_limit);
+
+        let mut unique_files = Vec::with_capacity(result.matches.len());
+        let mut index_map = vec![None; result.files.len()];
+
+        for m in &mut result.matches {
+            let old_idx = m.file_index;
+            let new_idx = match index_map[old_idx] {
+                Some(idx) => idx,
+                None => {
+                    let idx = unique_files.len();
+                    unique_files.push(result.files[old_idx]);
+                    index_map[old_idx] = Some(idx);
+                    idx
+                }
+            };
+            m.file_index = new_idx;
+        }
+        result.files = unique_files;
+        result.files_with_matches = result.files.len();
+    }
+
+    result
 }
