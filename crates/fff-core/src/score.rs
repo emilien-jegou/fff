@@ -335,7 +335,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .map(|path_match| {
             let dir = working_dirs[path_match.index as usize];
             let base_score = path_match.score as i32;
-            let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
+            let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 500;
 
             // Distance penalty from current file's directory.
             let distance_penalty = if context.current_file.is_some() {
@@ -357,7 +357,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
                 && main_needle.eq_ignore_ascii_case(dirname_buf.as_bytes());
 
             let filename_bonus = if is_exact_dirname {
-                base_score / 5 * 2 // 40% bonus for exact dirname match
+                base_score / 10 // 10% bonus
             } else if is_dirname_match {
                 base_score / 6 // ~16% bonus for fuzzy dirname match
             } else {
@@ -668,7 +668,7 @@ fn match_and_score_in_arena<'a>(
                 match last_same_query_match {
                     Some(_) if context.min_combo_count == 0 => 1000,
                     Some(combo_match) if combo_match.open_count >= context.min_combo_count => {
-                        combo_match.open_count as i32 * context.combo_boost_score_multiplier
+                        (combo_match.open_count as i32 * context.combo_boost_score_multiplier).min(base_score / 4)
                     }
                     Some(combo_match) => combo_match.open_count as i32 * 5,
                     _ => 0,
