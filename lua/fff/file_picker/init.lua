@@ -37,11 +37,9 @@ end
 --- @param max_results number|nil Maximum number of results (optional)
 --- @param max_threads number|nil Maximum number of threads (optional)
 --- @param current_file string|nil Path to current file to deprioritize (optional)
---- @param min_combo_count_override number|nil Optional override for min_combo_count (nil uses config)
 --- @return table List of matching files
-function M.search_files(query, current_file, max_results, max_threads, min_combo_count_override)
-  -- Delegate to paginated version with offset=0 and limit=max_results
-  return M.search_files_paginated(query, current_file, max_threads, min_combo_count_override, 0, max_results)
+function M.search_files(query, current_file, max_results, max_threads)
+  return M.search_files_paginated(query, current_file, max_threads, 0, max_results)
 end
 
 --- Search files with pagination support
@@ -49,11 +47,10 @@ end
 --- @param query string Search query
 --- @param current_file string|nil Path to current file to deprioritize (optional)
 --- @param max_threads number|nil Maximum number of threads to use
---- @param min_combo_count_override number|nil Optional override for min_combo_count (nil uses config)
 --- @param page_index number Page index (0-based: 0, 1, 2, ...)
 --- @param page_size number|nil Items per page (nil uses config default)
 --- @return table List of matching files
-function M.search_files_paginated(query, current_file, max_threads, min_combo_count_override, page_index, page_size)
+function M.search_files_paginated(query, current_file, max_threads, page_index, page_size)
   local config = require('fff.conf').get()
   if not M.state.initialized then return {} end
 
@@ -61,12 +58,6 @@ function M.search_files_paginated(query, current_file, max_threads, min_combo_co
   page_index = page_index or 0
   page_size = page_size or 0
 
-  local min_combo_count = min_combo_count_override
-  if min_combo_count == nil then min_combo_count = config.history and config.history.min_combo_count or 3 end
-
-  local combo_boost_score_multiplier = config.history and config.history.combo_boost_score_multiplier or 100
-
-  -- Convert page_index to offset (Rust expects offset in items, not page number)
   local offset = page_index * page_size
 
   local ok, search_result = pcall(
@@ -74,8 +65,6 @@ function M.search_files_paginated(query, current_file, max_threads, min_combo_co
     query,
     max_threads,
     current_file,
-    combo_boost_score_multiplier,
-    min_combo_count,
     offset,
     page_size
   )
@@ -150,14 +139,22 @@ end
 function M.is_initialized() return M.state.initialized end
 
 --- Get scan progress information
---- @return table Progress information with scanned_files_count, is_scanning
+--- @return table Progress information with scanned_files_count, is_scanning, is_warmup_complete, is_index_ready
 function M.get_scan_progress()
-  if not M.state.initialized then return { total_files = 0, scanned_files_count = 0, is_scanning = false } end
+  if not M.state.initialized then
+    return {
+      total_files = 0,
+      scanned_files_count = 0,
+      is_scanning = false,
+      is_warmup_complete = false,
+      is_index_ready = false,
+    }
+  end
 
   local ok, result = pcall(fuzzy.get_scan_progress)
   if not ok then
     vim.notify('Failed to get scan progress: ' .. tostring(result), vim.log.levels.WARN)
-    return { scanned_files_count = 0, is_scanning = false }
+    return { scanned_files_count = 0, is_scanning = false, is_warmup_complete = false, is_index_ready = false }
   end
 
   return result

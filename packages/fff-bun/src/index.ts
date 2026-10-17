@@ -10,6 +10,7 @@ export type {
   GrepCursor,
   GrepMatch,
   GrepMode,
+  DefinitionMode,
   GrepOptions,
   GrepResult,
   HealthCheck,
@@ -24,6 +25,11 @@ export type {
   Score,
   SearchOptions,
   SearchResult,
+  WatchBatchCallback,
+  WatchEvent,
+  WatchEventKind,
+  WatchOptions,
+  WatchUnsubscribe,
 } from "./fff-api";
 
 export { FileFinder } from "./finder";

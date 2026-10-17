@@ -22,6 +22,9 @@ export function normalizePathConstraint(
   // Strip a leading `./` so `./**/*.rs` and `**/*.rs` behave identically.
   if (trimmed.startsWith("./")) trimmed = trimmed.slice(2);
 
+  // wif we left with the ** it means anything so treat it as a cwd path
+  if (trimmed === "**" || trimmed === "**/" || trimmed === "**/*") return null;
+
   // FFF's glob matcher can treat a hidden directory root glob such as
   // `.agents/**` as empty, while the tool contract says this means "inside
   // this directory". Collapse simple trailing recursive directory globs to the

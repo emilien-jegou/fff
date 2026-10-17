@@ -2,13 +2,13 @@ import { after, before, describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { FileFinder } from "../dist/src/index.js";
+import { FileFinder } from "../dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
 const normalizePath = (p) => p.replace(/\\/g, "/");
 
-/** @type {import("../dist/src/finder.js").FileFinder | null} */
+/** @type {import("../dist/finder.js").FileFinder | null} */
 let finder = null;
 
 describe("fff-node", { concurrency: 1 }, () => {
@@ -98,6 +98,17 @@ describe("fff-node", { concurrency: 1 }, () => {
         assert.equal(typeof s[f], "number", `${f} should be a number`);
       }
       assert.equal(typeof s.matchType, "string");
+    });
+
+    it("exact filename query decodes exactMatch=true (#888)", () => {
+      const r = finder.fileSearch("Cargo.toml", { pageSize: 5 });
+      assert.ok(r.ok);
+      const idx = r.value.items.findIndex((i) => i.relativePath === "Cargo.toml");
+      assert.ok(idx >= 0, "root Cargo.toml should be in results");
+      const s = r.value.scores[idx];
+      assert.equal(s.matchType, "exact_filename");
+      assert.equal(s.exactMatch, true);
+      assert.equal(typeof s.pathAlignmentBonus, "number");
     });
 
     it("totalMatched <= totalFiles", () => {
@@ -192,6 +203,27 @@ describe("fff-node", { concurrency: 1 }, () => {
       assert.equal(typeof m.byteOffset, "number");
       assert.ok(Array.isArray(m.matchRanges));
       console.log(m.matchRanges);
+    });
+
+    it("plain grep on text files never reports binary/definition/fuzzy flags (#888)", () => {
+      const r = finder.grep("FffResult", { mode: "plain", pageSize: 100 });
+      assert.ok(r.ok);
+      assert.ok(r.value.items.length > 1);
+      for (const m of r.value.items) {
+        assert.equal(m.isBinary, false, `${m.relativePath}:${m.lineNumber} flagged binary`);
+        assert.equal(m.isDefinition, undefined, `${m.relativePath}:${m.lineNumber} flagged definition`);
+        assert.equal(m.fuzzyScore, undefined, `${m.relativePath}:${m.lineNumber} has fuzzyScore in plain mode`);
+      }
+    });
+
+    it("fuzzy grep decodes fuzzyScore as u16", () => {
+      const r = finder.grep("FfRslt", { mode: "fuzzy", pageSize: 20 });
+      assert.ok(r.ok);
+      assert.ok(r.value.items.length > 0);
+      for (const m of r.value.items) {
+        assert.equal(typeof m.fuzzyScore, "number");
+        assert.ok(m.fuzzyScore >= 0 && m.fuzzyScore <= 0xffff, `fuzzyScore out of u16 range: ${m.fuzzyScore}`);
+      }
     });
 
     it("pagination returns a second page", () => {

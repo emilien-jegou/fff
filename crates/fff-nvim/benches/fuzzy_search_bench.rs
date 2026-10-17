@@ -169,8 +169,7 @@ fn bench_search_queries(c: &mut Criterion) {
                         current_file: None,
                         project_path: None,
 
-                        combo_boost_score_multiplier: 100,
-                        min_combo_count: 3,
+
                         pagination: PaginationArgs {
                             offset: 0,
                             limit: 100,
@@ -219,9 +218,6 @@ fn bench_search_thread_scaling(c: &mut Criterion) {
                             max_threads: threads,
                             current_file: None,
                             project_path: None,
-
-                            combo_boost_score_multiplier: 100,
-                            min_combo_count: 3,
                             pagination: PaginationArgs {
                                 offset: 0,
                                 limit: 100,
@@ -269,8 +265,7 @@ fn bench_search_result_limits(c: &mut Criterion) {
                         current_file: None,
                         project_path: None,
 
-                        combo_boost_score_multiplier: 100,
-                        min_combo_count: 3,
+
                         pagination: PaginationArgs { offset: 0, limit },
                     },
                 );
@@ -326,8 +321,7 @@ fn bench_search_scalability(c: &mut Criterion) {
                         current_file: None,
                         project_path: None,
 
-                        combo_boost_score_multiplier: 100,
-                        min_combo_count: 3,
+
                         pagination: PaginationArgs {
                             offset: 0,
                             limit: 100,
@@ -372,9 +366,6 @@ fn bench_search_ordering(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 0,
                         limit: 100,
@@ -395,9 +386,6 @@ fn bench_search_ordering(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 0,
                         limit: 100,
@@ -418,9 +406,6 @@ fn bench_search_ordering(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 0,
                         limit: 500,
@@ -440,9 +425,6 @@ fn bench_search_ordering(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 0,
                         limit: 500,
@@ -463,9 +445,6 @@ fn bench_search_ordering(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 0,
                         limit: 10,
@@ -485,9 +464,6 @@ fn bench_search_ordering(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 0,
                         limit: 10,
@@ -532,9 +508,6 @@ fn bench_pagination_performance(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 0,
                         limit: page_size,
@@ -555,9 +528,6 @@ fn bench_pagination_performance(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 10,
                         limit: page_size,
@@ -578,9 +548,6 @@ fn bench_pagination_performance(c: &mut Criterion) {
                     max_threads: 4,
                     current_file: None,
                     project_path: None,
-
-                    combo_boost_score_multiplier: 100,
-                    min_combo_count: 3,
                     pagination: PaginationArgs {
                         offset: 50,
                         limit: page_size,
@@ -614,13 +581,15 @@ fn bench_grep_search(c: &mut Criterion) {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 0,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 100,
         mode: GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     };

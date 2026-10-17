@@ -1,5 +1,5 @@
 {
-  description = "fff.nvim";
+  description = "fff";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -62,6 +62,10 @@
             openssl
           ];
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+          # in zlob we compile by default with -target=native unless CI is detected, because 
+          # nix is different we have to make sure that the build target is a baseline cpu
+          CI = "1";
 
           # Zig 0.16 insists on writing to its global cache even when the
           # zlob build.rs passes --global-cache-dir. In the nix sandbox $HOME

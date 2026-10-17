@@ -7,11 +7,18 @@ use std::collections::{HashMap, VecDeque};
 
 const MAX_CURSORS: usize = 20;
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GrepCursor {
+    pub file_offset: usize,
+    pub definitions_only: bool,
+    pub found_definitions: bool,
+}
+
 /// Stores cursor state for paginated grep results.
 pub struct CursorStore {
     counter: u64,
     /// Map from cursor ID string → file offset for next page.
-    cursors: HashMap<String, usize>,
+    cursors: HashMap<String, GrepCursor>,
     /// Insertion order for LRU eviction.
     insertion_order: VecDeque<String>,
 }
@@ -27,10 +34,17 @@ impl CursorStore {
 
     /// Store a cursor and return its opaque ID string.
     pub fn store(&mut self, file_offset: usize) -> String {
+        self.store_grep(GrepCursor {
+            file_offset,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn store_grep(&mut self, cursor: GrepCursor) -> String {
         self.counter = self.counter.wrapping_add(1);
         let id = self.counter.to_string();
 
-        self.cursors.insert(id.clone(), file_offset);
+        self.cursors.insert(id.clone(), cursor);
         self.insertion_order.push_back(id.clone());
 
         // Evict oldest cursors
@@ -47,6 +61,10 @@ impl CursorStore {
 
     /// Retrieve the file offset for a cursor ID.
     pub fn get(&self, id: &str) -> Option<usize> {
+        self.get_grep(id).map(|cursor| cursor.file_offset)
+    }
+
+    pub(crate) fn get_grep(&self, id: &str) -> Option<GrepCursor> {
         self.cursors.get(id).copied()
     }
 }

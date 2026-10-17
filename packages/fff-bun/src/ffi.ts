@@ -8,10 +8,19 @@
  * be passed to all subsequent calls and freed with `ffiDestroy`.
  */
 
-import { CString, dlopen, FFIType, type Pointer, ptr, read } from "bun:ffi";
+import {
+  CString,
+  dlopen,
+  FFIType,
+  type JSCallback,
+  type Pointer,
+  ptr,
+  read,
+} from "bun:ffi";
 import { findBinary } from "./download";
 import { embeddedLibPath } from "./embedded";
 import type {
+  DefinitionMode,
   DirItem,
   DirSearchResult,
   FileItem,
@@ -24,8 +33,10 @@ import type {
   ScanProgress,
   Score,
   SearchResult,
+  WatchEvent,
+  WatchEventKind,
 } from "./fff-api";
-import { createGrepCursor, err } from "./fff-api";
+import { createGrepCursor, definitionModeToInt, err } from "./fff-api";
 
 /** Grep mode constants matching the C API (u8). */
 const GREP_MODE_PLAIN = 0;
@@ -81,8 +92,6 @@ const ffiDefinition = {
       FFIType.u32, // max_threads
       FFIType.u32, // page_index
       FFIType.u32, // page_size
-      FFIType.i32, // combo_boost_multiplier
-      FFIType.u32, // min_combo_count
     ],
     returns: FFIType.ptr,
   },
@@ -122,14 +131,12 @@ const ffiDefinition = {
       FFIType.u32, // max_threads
       FFIType.u32, // page_index
       FFIType.u32, // page_size
-      FFIType.i32, // combo_boost_multiplier
-      FFIType.u32, // min_combo_count
     ],
     returns: FFIType.ptr,
   },
 
   // Live grep (content search)
-  fff_live_grep: {
+  fff_live_grep_ex: {
     args: [
       FFIType.ptr, // handle
       FFIType.cstring, // query
@@ -140,15 +147,16 @@ const ffiDefinition = {
       FFIType.u32, // file_offset
       FFIType.u32, // page_limit
       FFIType.u64, // time_budget_ms
+      FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
-      FFIType.bool, // classify_definitions
+      FFIType.u8, // classify_definitions
     ],
     returns: FFIType.ptr,
   },
 
   // Multi-pattern grep (Aho-Corasick)
-  fff_multi_grep: {
+  fff_multi_grep_ex: {
     args: [
       FFIType.ptr, // handle
       FFIType.cstring, // patterns_joined (\n-separated)
@@ -159,9 +167,10 @@ const ffiDefinition = {
       FFIType.u32, // file_offset
       FFIType.u32, // page_limit
       FFIType.u64, // time_budget_ms
+      FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
-      FFIType.bool, // classify_definitions
+      FFIType.u8, // classify_definitions
     ],
     returns: FFIType.ptr,
   },
@@ -189,6 +198,48 @@ const ffiDefinition = {
   },
   fff_restart_index: {
     args: [FFIType.ptr, FFIType.cstring],
+    returns: FFIType.ptr,
+  },
+
+  // Watch subscriptions
+  fff_set_watch_callback: {
+    args: [
+      FFIType.ptr, // handle
+      FFIType.function, // FffWatchCallback (instance-wide)
+      FFIType.ptr, // user_data
+    ],
+    returns: FFIType.ptr,
+  },
+  fff_watch: {
+    args: [
+      FFIType.ptr, // handle
+      FFIType.cstring, // pattern
+      FFIType.ptr, // *const FffWatchOptions (or NULL)
+    ],
+    returns: FFIType.ptr,
+  },
+  fff_unwatch: {
+    args: [FFIType.ptr, FFIType.u64], // handle, watch_id
+    returns: FFIType.ptr,
+  },
+  fff_free_watch_events: {
+    args: [FFIType.ptr],
+    returns: FFIType.void,
+  },
+  fff_watch_events_count: {
+    args: [FFIType.ptr],
+    returns: FFIType.u32,
+  },
+  fff_watch_events_get_path: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  fff_watch_events_get_kind: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.u8,
+  },
+  fff_watch_events_get_from_path: {
+    args: [FFIType.ptr, FFIType.u32],
     returns: FFIType.ptr,
   },
 
@@ -607,7 +658,8 @@ const SC_FREC = 16; // i32         (4)
 const SC_DIST = 20; // i32         (4)
 const SC_CURFILE = 24; // i32         (4)
 const SC_COMBO = 28; // i32         (4)
-const SC_EXACT = 32; // bool        (1 + 7 pad)
+const SC_PATH_ALIGN = 32; // i32         (4)
+const SC_EXACT = 36; // bool        (1 + 3 pad)
 const SC_MTYPE = 40; // *mut c_char (8)
 const SC_SIZE_OF = 48;
 
@@ -647,6 +699,7 @@ function readScoreStruct(p: number): Score {
     distancePenalty: read.i32(pp, SC_DIST),
     currentFilePenalty: read.i32(pp, SC_CURFILE),
     comboMatchBoost: read.i32(pp, SC_COMBO),
+    pathAlignmentBonus: read.i32(pp, SC_PATH_ALIGN),
     exactMatch: read.u8(pp, SC_EXACT) !== 0,
     matchType: readCString(read.ptr(pp, SC_MTYPE)) ?? "",
   };
@@ -1196,12 +1249,16 @@ export function ffiLiveGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_live_grep(
+  const resultPtr = library.symbols.fff_live_grep_ex(
     handle,
     ptr(encodeString(query)),
     grepModeToU8(mode),
@@ -1211,9 +1268,10 @@ export function ffiLiveGrep(
     fileOffset,
     pageLimit,
     BigInt(timeBudgetMs),
+    enforceTimeBudget,
     beforeContext,
     afterContext,
-    classifyDefinitions,
+    definitionMode,
   );
   return parseGrepResult(resultPtr);
 }
@@ -1231,12 +1289,16 @@ export function ffiMultiGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_multi_grep(
+  const resultPtr = library.symbols.fff_multi_grep_ex(
     handle,
     ptr(encodeString(patternsJoined)),
     ptr(encodeString(constraints)),
@@ -1246,9 +1308,10 @@ export function ffiMultiGrep(
     fileOffset,
     pageLimit,
     BigInt(timeBudgetMs),
+    enforceTimeBudget,
     beforeContext,
     afterContext,
-    classifyDefinitions,
+    definitionMode,
   );
   return parseGrepResult(resultPtr);
 }
@@ -1325,6 +1388,125 @@ export function ffiRestartIndex(handle: NativeHandle, newPath: string): Result<v
   const library = loadLibrary();
   const resultPtr = library.symbols.fff_restart_index(handle, ptr(encodeString(newPath)));
   return parseVoidResult(resultPtr);
+}
+
+// ---------------------------------------------------------------------------
+// Watch struct byte offsets (must match #[repr(C)] layout on 64-bit)
+// ---------------------------------------------------------------------------
+
+// MUST match `crates/fff-c`::FffWatchOptions
+const FFF_WATCH_OPTIONS_VERSION = 1;
+const FFF_WATCH_OPTIONS_SIZE = 24;
+const FWO_VERSION = 0; // u32 (4 + 4 pad)
+const FWO_IGNORE = 8; // *const *const c_char (8)
+const FWO_IGNORE_COUNT = 16; // u32 (4 + 4 pad)
+
+/** kind u8 -> WatchEventKind. Unknown values degrade to "rescan". */
+const WATCH_EVENT_KINDS: readonly WatchEventKind[] = [
+  "created",
+  "modified",
+  "removed",
+  "rescan",
+  "renamed",
+];
+
+/**
+ * Parse an FffWatchEventBatch delivered to a watch callback, then free it.
+ * Ownership of the batch transfers to JS at callback time, so this MUST be
+ * called exactly once per delivered batch pointer.
+ */
+export function readWatchEventBatch(batchPtr: Pointer | number | null): WatchEvent[] {
+  if (batchPtr === null || (batchPtr as unknown as number) === 0) {
+    return [];
+  }
+
+  const bp = batchPtr as unknown as Pointer;
+  const symbols = loadLibrary().symbols;
+  const count = symbols.fff_watch_events_count(bp);
+
+  const events: WatchEvent[] = [];
+  for (let i = 0; i < count; i++) {
+    const path = symbols.fff_watch_events_get_path(bp, i) as Pointer | null;
+    const kind = symbols.fff_watch_events_get_kind(bp, i) as number;
+    const event: WatchEvent = {
+      path: readCString(path) ?? "",
+      kind: WATCH_EVENT_KINDS[kind] ?? "rescan",
+    };
+    if (event.kind === "renamed") {
+      const from = symbols.fff_watch_events_get_from_path(bp, i) as Pointer | null;
+      const decoded = readCString(from);
+      if (decoded) event.from = decoded;
+    }
+    events.push(event);
+  }
+
+  symbols.fff_free_watch_events(bp);
+  return events;
+}
+
+/**
+ * Register the instance-wide watch callback. Must be called before the
+ * first `ffiWatch`. The caller owns `callback` (a threadsafe `JSCallback`
+ * built in finder.ts) and must keep it alive until after `ffiDestroy`
+ * returns for this handle — that call is the delivery quiescence barrier.
+ */
+export function ffiSetWatchCallback(
+  handle: NativeHandle,
+  callback: JSCallback,
+): Result<void> {
+  const library = loadLibrary();
+  if (callback.ptr === null) {
+    return err("watch callback has been closed");
+  }
+  const resultPtr = library.symbols.fff_set_watch_callback(handle, callback.ptr, null);
+  return parseVoidResult(resultPtr);
+}
+
+/**
+ * Subscribe to filesystem changes; batches are delivered through the
+ * instance callback registered with `ffiSetWatchCallback`, tagged with the
+ * watch id this function returns.
+ *
+ * @returns The native watch id carried in `FffResult.int_value`.
+ */
+export function ffiWatch(
+  handle: NativeHandle,
+  pattern: string,
+  ignore: string[] = [],
+): Result<number> {
+  const library = loadLibrary();
+
+  // Keep every buffer referenced until the FFI call returns: the options
+  // struct, the pointer array, and each encoded ignore string.
+  const opts = Buffer.alloc(FFF_WATCH_OPTIONS_SIZE);
+  opts.writeUInt32LE(FFF_WATCH_OPTIONS_VERSION, FWO_VERSION);
+
+  const ignoreBuffers = ignore.map((entry) => encodeString(entry));
+  const ignorePtrs = Buffer.alloc(Math.max(ignoreBuffers.length, 1) * 8);
+  for (let i = 0; i < ignoreBuffers.length; i++) {
+    ignorePtrs.writeBigUInt64LE(BigInt(ptr(ignoreBuffers[i] as Uint8Array)), i * 8);
+  }
+  opts.writeBigUInt64LE(
+    ignoreBuffers.length > 0 ? BigInt(ptr(ignorePtrs)) : 0n,
+    FWO_IGNORE,
+  );
+  opts.writeUInt32LE(ignoreBuffers.length, FWO_IGNORE_COUNT);
+
+  const resultPtr = library.symbols.fff_watch(
+    handle,
+    ptr(encodeString(pattern)),
+    ptr(opts),
+  );
+  return parseIntResult(resultPtr);
+}
+
+/**
+ * Remove a watch subscription. Returns true if the id was found.
+ */
+export function ffiUnwatch(handle: NativeHandle, watchId: number): Result<boolean> {
+  const library = loadLibrary();
+  const resultPtr = library.symbols.fff_unwatch(handle, BigInt(watchId));
+  return parseBoolResult(resultPtr);
 }
 
 /**

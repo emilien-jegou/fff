@@ -49,6 +49,14 @@ impl<C: ParserConfig> QueryParser<C> {
         Self { config }
     }
 
+    /// Parse a field containing only constraints.
+    pub fn parse_constraints<'a>(&self, query: &'a str) -> ConstraintVec<'a> {
+        query
+            .split_whitespace()
+            .filter_map(|token| parse_token(token, &self.config))
+            .collect()
+    }
+
     pub fn parse<'a>(&self, query: &'a str) -> FFFQuery<'a> {
         let raw_query = query;
         let config: &C = &self.config;
@@ -364,8 +372,11 @@ fn parse_negation<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Con
         return Some(Constraint::Not(Box::new(inner_constraint)));
     }
 
-    // If it's not a special constraint, treat it as negated text
-    // For backward compatibility with !test syntax
+    // Negated text (!test) requires ≥3 inner chars with at least one alphanumeric,
+    // so operators like `!=`, `!==`, `!!` stay literal search text.
+    if inner_token.len() < 3 || !inner_token.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
     Some(Constraint::Not(Box::new(Constraint::Text(inner_token))))
 }
 
@@ -495,7 +506,7 @@ fn parse_git_status(value: &str) -> Option<Constraint<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileSearchConfig, GrepConfig};
+    use crate::{AiGrepConfig, FileSearchConfig, GrepConfig};
 
     /// File-picker-like config with filename-constraint detection enabled,
     /// mirroring the Neovim layer's opt-in behavior.
@@ -610,6 +621,38 @@ mod tests {
             }
             _ => panic!("Expected Not constraint"),
         }
+    }
+
+    #[test]
+    fn test_negation_operators_stay_literal() {
+        let parser = QueryParser::new(GrepConfig);
+        // Operator-like tokens must not become exclusion constraints
+        for query in [
+            "Ordering::Acquire) != delivery.epoch",
+            "a !== b",
+            "x !! y",
+            "foo !~ bar",
+        ] {
+            let result = parser.parse(query);
+            assert!(
+                result.constraints.is_empty(),
+                "{query:?} produced constraints {:?}",
+                result.constraints
+            );
+            assert_eq!(result.grep_text(), query, "grep text must equal raw query");
+        }
+    }
+
+    #[test]
+    fn test_negation_short_text_stays_literal() {
+        let parser = QueryParser::new(FileSearchConfig);
+        // Inner text < 3 chars is not a Not constraint
+        let result = parser.parse("!ab foo");
+        assert!(result.constraints.is_empty());
+        // Inner text >= 3 chars still is
+        let result = parser.parse("!abc foo");
+        assert_eq!(result.constraints.len(), 1);
+        assert!(matches!(&result.constraints[0], Constraint::Not(_)));
     }
 
     #[test]
@@ -982,6 +1025,42 @@ mod tests {
             result.constraints[0]
         );
         assert_eq!(result.grep_text(), "pattern");
+    }
+
+    #[test]
+    fn test_standalone_constraints_preserve_directory() {
+        let result = QueryParser::new(AiGrepConfig).parse_constraints("scope-a/");
+        assert_eq!(result.as_slice(), &[Constraint::PathSegment("scope-a")]);
+    }
+
+    #[test]
+    fn test_plain_constraints_preserve_directory_only() {
+        let directory = QueryParser::new(GrepConfig).parse_constraints("scope-a/");
+        assert_eq!(directory.as_slice(), &[Constraint::PathSegment("scope-a")]);
+
+        let file = QueryParser::new(GrepConfig).parse_constraints("scope-a/one.txt");
+        assert!(file.is_empty());
+    }
+
+    #[test]
+    fn test_standalone_constraints_preserve_file() {
+        let result = QueryParser::new(AiGrepConfig).parse_constraints("scope-a/one.txt");
+        assert_eq!(
+            result.as_slice(),
+            &[Constraint::FilePath("scope-a/one.txt")]
+        );
+    }
+
+    #[test]
+    fn test_standalone_constraints_preserve_file_without_search_text() {
+        let result = QueryParser::new(AiGrepConfig).parse_constraints("scope-a/ scope-a/one.txt");
+        assert_eq!(
+            result.as_slice(),
+            &[
+                Constraint::PathSegment("scope-a"),
+                Constraint::FilePath("scope-a/one.txt")
+            ]
+        );
     }
 
     #[test]
@@ -1409,6 +1488,40 @@ mod tests {
             "v2.0 should not be a FilePath constraint, got {:?}",
             result.constraints
         );
+    }
+
+    #[test]
+    fn test_dotted_numbers_are_not_filename_constraints() {
+        fn assert_dotted_numbers_stay_text<C: ParserConfig>(config: C, label: &str) {
+            let parser = QueryParser::new(config);
+
+            for query in ["192.168.1.1 timeout", "v2.0 release", "python 3.11"] {
+                let result = parser.parse(query);
+                assert!(
+                    result.constraints.is_empty(),
+                    "{label}: {query:?} must stay search text, got {:?}",
+                    result.constraints
+                );
+            }
+
+            // Real filenames still scope the search (passes before and after).
+            assert_eq!(
+                parser.parse("schema.rs users").constraints.as_slice(),
+                [Constraint::FilePath("schema.rs")],
+                "{label}: a bare filename must still be a constraint"
+            );
+            assert_eq!(
+                parser
+                    .parse("libswscale/input.c avframe")
+                    .constraints
+                    .as_slice(),
+                [Constraint::FilePath("libswscale/input.c")],
+                "{label}: a path-prefixed filename must still be a constraint"
+            );
+        }
+
+        assert_dotted_numbers_stay_text(AiGrepConfig, "ai-grep");
+        assert_dotted_numbers_stay_text(FilenameConstraintConfig, "filename-constraint");
     }
 
     #[test]

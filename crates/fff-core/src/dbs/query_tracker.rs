@@ -1,6 +1,7 @@
 use super::db_healthcheck::DbHealthChecker;
-use super::lmdb::{DbHealth, LmdbStore, is_map_full};
+use super::env_pool::SharedEnv;
 use crate::error::Error;
+use crate::lmdb::{DbHealth, LmdbStore, is_map_full};
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, Env};
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ struct HistoryEntry {
 
 #[derive(Debug)]
 pub struct QueryTracker {
-    env: Env,
+    env: SharedEnv,
     // Database for (project_path, query) -> QueryMatchEntry mappings
     query_file_db: Database<Bytes, SerdeBincode<QueryMatchEntry>>,
     // Database for project_path -> VecDeque<HistoryEntry> mappings (file picker)
@@ -38,7 +39,7 @@ pub struct QueryTracker {
 }
 
 impl DbHealthChecker for QueryTracker {
-    fn get_env(&self) -> &Env {
+    fn get_env(&self) -> &Env<heed::WithoutTls> {
         &self.env
     }
 
@@ -92,7 +93,7 @@ impl LmdbStore for QueryTracker {
     const MAX_DBS: u32 = 16;
     const SIZE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
-    fn env(&self) -> &Env {
+    fn shared_env(&self) -> &SharedEnv {
         &self.env
     }
 
@@ -197,7 +198,7 @@ impl QueryTracker {
     /// offset=0 returns most recent, offset=1 returns 2nd most recent, etc.
     fn read_history_at_offset(
         db: &Database<Bytes, SerdeBincode<VecDeque<HistoryEntry>>>,
-        env: &Env,
+        env: &Env<heed::WithoutTls>,
         project_key: &[u8; 32],
         offset: usize,
     ) -> Result<Option<String>, Error> {
@@ -331,7 +332,6 @@ impl QueryTracker {
         &self,
         query: &str,
         project_path: &Path,
-        min_combo_count: u32,
     ) -> Result<Option<QueryMatchEntry>, Error> {
         let query_key = Self::create_query_key(project_path, query)?;
         let rtxn = self
@@ -350,7 +350,7 @@ impl QueryTracker {
                 source,
             })?;
 
-        Ok(last_match.filter(|entry| entry.open_count >= min_combo_count))
+        Ok(last_match)
     }
 
     pub fn get_last_query_path(

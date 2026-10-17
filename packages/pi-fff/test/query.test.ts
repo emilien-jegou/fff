@@ -68,4 +68,12 @@ describe("path constraint normalization", () => {
       "src/**/*.ts",
     );
   });
+
+  test("bare recursive globs constrain nothing", () => {
+    expect(normalizePathConstraint("**", cwd)).toBeNull();
+    expect(normalizePathConstraint("**/", cwd)).toBeNull();
+    expect(normalizePathConstraint("**/*", cwd)).toBeNull();
+    expect(normalizePathConstraint("./**", cwd)).toBeNull();
+    expect(buildQuery("**", "needle", undefined, cwd)).toBe("needle");
+  });
 });

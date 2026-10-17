@@ -1,8 +1,5 @@
-//! FFI-compatible type definitions
-//!
-//! All result types use `#[repr(C)]` structs for direct memory access from any
-//! language with C FFI support. No JSON serialization is used for search or grep
-//! results — callers read struct fields directly.
+//! FFI-compatible type definitions: all result types are `#[repr(C)]` structs
+//! read directly from any language with C FFI — no JSON serialization.
 
 use std::ffi::{CString, c_char, c_void};
 use std::ptr;
@@ -19,12 +16,12 @@ pub const FFF_CREATE_OPTIONS_VERSION: u32 = 2;
 
 /// Options for `fff_create_instance_with`.
 ///
-/// Versioned struct: you populate the struct at your call level, we guarantee that
-/// the version is stable across the version changes, new fields only appended!
+/// Versioned struct: the layout is stable across releases, new fields are
+/// only appended.
 #[repr(C)]
 pub struct FffCreateOptions {
-    /// Set to [`FFF_CREATE_OPTIONS_VERSION`] when allocating. Used by the
-    /// library to determine which trailing fields are populated.
+    /// Set to [`FFF_CREATE_OPTIONS_VERSION`] when allocating; tells the
+    /// library which trailing fields are populated.
     pub version: u32,
     /// Directory to index (required, non-NULL).
     pub base_path: *const c_char,
@@ -51,16 +48,14 @@ pub struct FffCreateOptions {
     pub cache_budget_max_bytes: u64,
     /// Per-file byte cap inside the content cache. 0 = auto.
     pub cache_budget_max_file_size: u64,
-    /// Allow indexing the filesystem root (`/`). Off by default — root is
-    /// rarely the intended target and floods the watcher with churn.
+    /// Allow indexing the filesystem root (`/`). Off by default: root is rarely
+    /// intended and floods the watcher with churn.
     pub enable_fs_root_scanning: bool,
-    /// Allow indexing the user's home directory. Same trade-off as
-    /// `enable_fs_root_scanning`.
+    /// Allow indexing the user's home directory. Same trade-off as `enable_fs_root_scanning`.
     pub enable_home_dir_scanning: bool,
     // ----- v2 fields -----
-    /// Follow symlinks during scan and watcher walks. Off by default —
-    /// enabling this without external loop protection can wedge the watcher
-    /// on cyclic symlink graphs. Caller is responsible for the trade-off.
+    /// Follow symlinks during scan and watcher walks. Off by default: without
+    /// external loop protection cyclic symlinks can wedge the watcher.
     pub follow_symlinks: bool,
     // ----- new version 3+ fields go here, ALWAYS appended -----
 }
@@ -133,10 +128,8 @@ unsafe fn free_cstring_array(arr: *mut *mut c_char, count: u32) {
     }
 }
 
-/// A file item returned by `fff_search`.
-///
-/// All string fields are heap-allocated and owned by the parent `FffSearchResult`.
-/// Free the entire result with `fff_free_search_result`.
+/// A file item returned by `fff_search`. Strings are owned by the parent
+/// `FffSearchResult`; free everything with `fff_free_search_result`.
 #[repr(C)]
 pub struct FffFileItem {
     pub relative_path: *mut c_char,
@@ -189,13 +182,8 @@ impl FffFileItem {
 pub struct FffScore {
     pub total: i32,
     pub base_score: i32,
-    pub filename_bonus: i32,
-    pub special_filename_bonus: i32,
     pub frecency_boost: i32,
-    pub distance_penalty: i32,
     pub current_file_penalty: i32,
-    pub combo_match_boost: i32,
-    pub path_alignment_bonus: i32,
     pub exact_match: bool,
     pub match_type: *mut c_char,
 }
@@ -205,13 +193,8 @@ impl From<&Score> for FffScore {
         FffScore {
             total: score.total,
             base_score: score.base_score,
-            filename_bonus: score.filename_bonus,
-            special_filename_bonus: score.special_filename_bonus,
             frecency_boost: score.frecency_boost,
-            distance_penalty: score.distance_penalty,
             current_file_penalty: score.current_file_penalty,
-            combo_match_boost: score.combo_match_boost,
-            path_alignment_bonus: score.path_alignment_bonus,
             exact_match: score.exact_match,
             match_type: cstring_new(score.match_type),
         }
@@ -230,13 +213,9 @@ impl FffScore {
     }
 }
 
-/// Location parsed from a query string (e.g. `"file.ts:42:10"`).
-///
-/// `tag` encodes the variant:
-///   0 = no location,
-///   1 = line only (`line` is set),
-///   2 = position (`line` + `col`),
-///   3 = range (`line`/`col` = start, `end_line`/`end_col` = end).
+/// Location parsed from a query string (e.g. `"file.ts:42:10"`). `tag`:
+/// 0 = none, 1 = line, 2 = position (`line` + `col`),
+/// 3 = range (`line`/`col` = start, `end_line`/`end_col` = end).
 #[repr(C)]
 pub struct FffLocation {
     pub tag: u8,
@@ -281,14 +260,12 @@ impl From<Option<&Location>> for FffLocation {
     }
 }
 
-/// Search result returned by `fff_search`.
-///
-/// The caller must free this with `fff_free_search_result`.
+/// Search result returned by `fff_search`; free with `fff_free_search_result`.
 #[repr(C)]
 pub struct FffSearchResult {
-    /// Pointer to a heap-allocated array of `FffFileItem` (length = `count`).
+    /// Heap array of `FffFileItem` (length = `count`).
     pub items: *mut FffFileItem,
-    /// Pointer to a heap-allocated array of `FffScore` (length = `count`).
+    /// Heap array of `FffScore` (length = `count`).
     pub scores: *mut FffScore,
     /// Number of items/scores in the arrays.
     pub count: u32,
@@ -336,10 +313,8 @@ pub struct FffMatchRange {
     pub end: u32,
 }
 
-/// A single grep match with file and line information.
-///
-/// All string fields and arrays are heap-allocated. Free the parent
-/// `FffGrepResult` with `fff_free_grep_result` to release everything.
+/// A single grep match with file and line information. Strings and arrays are
+/// owned by the parent `FffGrepResult`; free everything with `fff_free_grep_result`.
 #[repr(C)]
 pub struct FffGrepMatch {
     // -- pointers (8 bytes each) --
@@ -441,12 +416,11 @@ impl FffGrepMatch {
     }
 }
 
-/// Grep result returned by `fff_live_grep` and `fff_multi_grep`.
-///
-/// The caller must free this with `fff_free_grep_result`.
+/// Grep result returned by `fff_live_grep` and `fff_multi_grep`;
+/// free with `fff_free_grep_result`.
 #[repr(C)]
 pub struct FffGrepResult {
-    /// Pointer to a heap-allocated array of `FffGrepMatch` (length = `count`).
+    /// Heap array of `FffGrepMatch` (length = `count`).
     pub items: *mut FffGrepMatch,
     /// Number of matches in the `items` array.
     pub count: u32,
@@ -583,10 +557,8 @@ impl FffResult {
     }
 }
 
-/// A directory item returned by `fff_search_directories`.
-///
-/// All string fields are heap-allocated and owned by the parent `FffDirSearchResult`.
-/// Free the entire result with `fff_free_dir_search_result`.
+/// A directory item returned by `fff_search_directories`. Strings are owned by
+/// the parent `FffDirSearchResult`; free everything with `fff_free_dir_search_result`.
 #[repr(C)]
 pub struct FffDirItem {
     pub relative_path: *mut c_char,
@@ -617,14 +589,13 @@ impl FffDirItem {
     }
 }
 
-/// Directory search result returned by `fff_search_directories`.
-///
-/// The caller must free this with `fff_free_dir_search_result`.
+/// Directory search result returned by `fff_search_directories`;
+/// free with `fff_free_dir_search_result`.
 #[repr(C)]
 pub struct FffDirSearchResult {
-    /// Pointer to a heap-allocated array of `FffDirItem` (length = `count`).
+    /// Heap array of `FffDirItem` (length = `count`).
     pub items: *mut FffDirItem,
-    /// Pointer to a heap-allocated array of `FffScore` (length = `count`).
+    /// Heap array of `FffScore` (length = `count`).
     pub scores: *mut FffScore,
     /// Number of items/scores in the arrays.
     pub count: u32,
@@ -659,9 +630,8 @@ impl FffDirSearchResult {
 }
 
 /// A single item in a mixed (files + directories) search result.
-///
-/// `item_type`: 0 = file, 1 = directory.
-/// All string fields are heap-allocated and owned by the parent `FffMixedSearchResult`.
+/// `item_type`: 0 = file, 1 = directory. Strings are owned by the parent
+/// `FffMixedSearchResult`.
 #[repr(C)]
 pub struct FffMixedItem {
     /// 0 = file, 1 = directory.
@@ -672,8 +642,7 @@ pub struct FffMixedItem {
     pub git_status: *mut c_char,
     pub size: u64,
     pub modified: u64,
-    /// The access frecency score for files, or max access frecency among all the immediate
-    /// children for directories.
+    /// Access frecency for files; max among immediate children for directories.
     pub access_frecency_score: i64,
     /// Always 0 for directories
     pub modification_frecency_score: i64,
@@ -730,14 +699,13 @@ impl FffMixedItem {
     }
 }
 
-/// Mixed search result returned by `fff_search_mixed`.
-///
-/// The caller must free this with `fff_free_mixed_search_result`.
+/// Mixed search result returned by `fff_search_mixed`
+/// free with `fff_free_mixed_search_result`.
 #[repr(C)]
 pub struct FffMixedSearchResult {
-    /// Pointer to a heap-allocated array of `FffMixedItem` (length = `count`).
+    /// Heap array of `FffMixedItem` (length = `count`).
     pub items: *mut FffMixedItem,
-    /// Pointer to a heap-allocated array of `FffScore` (length = `count`).
+    /// Heap array of `FffScore` (length = `count`).
     pub scores: *mut FffScore,
     /// Number of items/scores in the arrays.
     pub count: u32,

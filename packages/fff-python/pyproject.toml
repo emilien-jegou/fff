@@ -1,6 +1,6 @@
 [project]
 name = "fff-search"
-version = "0.9.6"
+version = "0.11.0"
 description = "Python bindings for FFF (Fast File Finder)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -15,8 +15,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/dmtrKovalenko/fff.nvim"
-Issues = "https://github.com/dmtrKovalenko/fff.nvim/issues"
+Repository = "https://github.com/dmtrKovalenko/fff"
+Issues = "https://github.com/dmtrKovalenko/fff/issues"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

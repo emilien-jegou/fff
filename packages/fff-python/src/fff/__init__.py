@@ -19,6 +19,8 @@ from fff._fff_python import (
     ScanProgress,
     Score,
     SearchResult,
+    WatchEvent,
+    WatchSubscription,
 )
 from fff._fff_python import FileFinder as _FileFinder
 
@@ -48,7 +50,7 @@ class FileFinder(_FileFinder):
         return True
 
 
-__version__ = "0.9.6"
+__version__ = "0.11.0"
 
 __all__ = [
     "FFFException",
@@ -66,5 +68,7 @@ __all__ = [
     "GrepResult",
     "GrepCursor",
     "ScanProgress",
+    "WatchEvent",
+    "WatchSubscription",
     "__version__",
 ]

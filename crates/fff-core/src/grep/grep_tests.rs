@@ -1,38 +1,135 @@
-use super::grep::*;
+use super::grep::replace_newline_escapes;
+use super::*;
 
-use crate::bigram_filter::BigramIndexBuilder;
 use crate::file_picker::{FilePicker, FilePickerOptions};
+use crate::index::BigramIndexBuilder;
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
 
 #[test]
-fn test_unescaped_newline_detection() {
-    // Single \n → multiline
-    assert!(has_unescaped_newline_escape("foo\\nbar"));
-    // \\n → escaped backslash + literal n, NOT multiline
-    // (this is what the user types when grepping Rust source with `\\nvim`)
-    assert!(!has_unescaped_newline_escape("foo\\\\nvim-data"));
-    // Real-world: source file has literal \\AppData\\Local\\nvim-data
-    // (double backslash in the file, so user types double backslash)
-    assert!(!has_unescaped_newline_escape(
-        r#"format!("{}\\AppData\\Local\\nvim-data","#
-    ));
-    // No \n at all
-    assert!(!has_unescaped_newline_escape("hello world"));
-    // \\\\n → even number of backslashes before n → NOT multiline
-    assert!(!has_unescaped_newline_escape("foo\\\\\\\\nbar"));
-    // \\\n → 3 backslashes: first two pair up, third + n = \n → multiline
-    assert!(has_unescaped_newline_escape("foo\\\\\\nbar"));
+fn sparse_matches_after_empty_batches_preserve_pagination() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..1536 {
+        let extension = if index < 512 { "rs" } else { "png" };
+        let path = root.path().join(format!("file_{index}.{extension}"));
+        let content = if [32, 100, 180, 240].contains(&index) {
+            "needle\n"
+        } else {
+            "ordinary content\n"
+        };
+        std::fs::write(&path, content).unwrap();
+        // `File::open` is read-only and Windows requires write access to set file times.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + index),
+            ))
+            .unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    for mode in [GrepMode::PlainText, GrepMode::Fuzzy] {
+        let query = parse_grep_query("needle *.rs");
+        let mut options = GrepSearchOptions {
+            mode,
+            page_limit: usize::MAX,
+            ..Default::default()
+        };
+        let result = picker.grep(&query, &options);
+        let expected: Vec<_> = result
+            .files
+            .iter()
+            .map(|file| file.relative_path(&picker))
+            .collect();
+        assert_eq!(expected.len(), 4);
+        assert_eq!(result.filtered_file_count, 512);
+
+        options.page_limit = 1;
+        let mut actual = Vec::new();
+        loop {
+            let page = picker.grep(&query, &options);
+            actual.extend(page.files.iter().map(|file| file.relative_path(&picker)));
+            assert_eq!(page.total_files, 1536);
+            if page.next_file_offset == 0 {
+                break;
+            }
+            assert!(page.next_file_offset > options.file_offset);
+            options.file_offset = page.next_file_offset;
+        }
+        assert_eq!(actual, expected);
+    }
 }
 
 #[test]
-fn test_replace_unescaped_newline() {
-    // \n → real newline
-    assert_eq!(replace_unescaped_newline_escapes("foo\\nbar"), "foo\nbar");
-    // \\n → preserved as-is
+fn pagination_keeps_unreturned_files_before_abort() {
+    let file = crate::types::FileItem::new_raw(0, 1, 0, None, false);
+    for (page_limit, next_offset) in [(1, 11), (2, 12), (10, 13)] {
+        let options = GrepSearchOptions {
+            file_offset: 10,
+            page_limit,
+            ..Default::default()
+        };
+        let results = (0..3)
+            .map(|idx| {
+                let matched = GrepMatch {
+                    file_index: 0,
+                    line_number: 1,
+                    col: 3,
+                    byte_offset: 0,
+                    line_content: "fn needle() {}".into(),
+                    match_byte_offsets: smallvec::smallvec![(3, 9)],
+                    fuzzy_score: Some(100),
+                    match_type: crate::types::MatchType::Case,
+                    context_before: Vec::new(),
+                    context_after: Vec::new(),
+                };
+                (idx, &file, vec![matched])
+            })
+            .collect();
+        let result = GrepResult::collect(results, 5, &options, 15, 15, Some(3));
+        assert_eq!(result.matches.len(), page_limit.min(3));
+        assert_eq!(result.next_file_offset, next_offset);
+    }
+}
+
+#[test]
+fn test_replace_newline_escapes() {
+    // Single \n → multiline: replaced with a real newline at byte 3
     assert_eq!(
-        replace_unescaped_newline_escapes("foo\\\\nvim"),
-        "foo\\\\nvim"
+        replace_newline_escapes("foo\\nbar"),
+        Some(("foo\nbar".to_string(), 3))
+    );
+    // \\n → escaped backslash + literal n, NOT multiline
+    // (this is what the user types when grepping Rust source with `\\nvim`)
+    assert_eq!(replace_newline_escapes("foo\\\\nvim-data"), None);
+    // Real-world: source file has literal \\AppData\\Local\\nvim-data
+    // (double backslash in the file, so user types double backslash)
+    assert_eq!(
+        replace_newline_escapes(r#"format!("{}\\AppData\\Local\\nvim-data","#),
+        None
+    );
+    // No \n at all
+    assert_eq!(replace_newline_escapes("hello world"), None);
+    // \\\\n → even number of backslashes before n → NOT multiline
+    assert_eq!(replace_newline_escapes("foo\\\\\\\\nbar"), None);
+    // \\\n → 3 backslashes: first two pair up, third + n = \n → multiline,
+    // newline lands after "foo" + 2 kept backslashes = byte 5
+    assert_eq!(
+        replace_newline_escapes("foo\\\\\\nbar"),
+        Some(("foo\\\\\nbar".to_string(), 5))
+    );
+    // Position is for the FIRST newline when there are several
+    assert_eq!(
+        replace_newline_escapes("a\\nb\\nc"),
+        Some(("a\nb\nc".to_string(), 1))
     );
 }
 
@@ -43,7 +140,7 @@ fn test_fuzzy_typo_scoring() {
     let max_typos = (needle.len() / 3).min(2); // 2
     let config = neo_frizbee::Config {
         max_typos: Some(max_typos as u16),
-        sort: false,
+        sort: neo_frizbee::SortStrategy::Unsorted,
         scoring: neo_frizbee::Scoring {
             exact_match_bonus: 100,
             ..neo_frizbee::Scoring::default()
@@ -55,7 +152,8 @@ fn test_fuzzy_typo_scoring() {
 
     // Helper: check if a match would pass our post-filters
     let passes = |n: &str, h: &str| -> bool {
-        let Some(mut mi) = neo_frizbee::match_list_indices(n, &[h], &config)
+        let Some(mut mi) = neo_frizbee::Matcher::new(n, &config)
+            .match_list_indices(&[h])
             .into_iter()
             .next()
         else {
@@ -67,7 +165,7 @@ fn test_fuzzy_typo_scoring() {
             return false;
         }
         if let (Some(&first), Some(&last)) = (mi.indices.first(), mi.indices.last()) {
-            let span = last - first + 1;
+            let span = (last - first + 1) as usize;
             if span > max_match_span {
                 return false;
             }
@@ -143,15 +241,13 @@ fn test_multi_grep_search() {
         max_file_size: MAX_FFFILE_SIZE,
         max_matches_per_file: 0,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 100,
         mode: super::GrepMode::PlainText,
-        time_budget_ms: 0,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
         trim_whitespace: false,
-        abort_signal: None,
     };
     let no_cancel = AtomicBool::new(false);
 
@@ -234,6 +330,94 @@ fn test_multi_grep_search() {
         0,
         "Empty patterns should find nothing"
     );
+}
+
+/// E2E: multiline grep (`\n` in query) and escaped-backslash literals (`\\n`)
+/// through the full picker.grep pipeline, in both PlainText and Regex modes.
+#[test]
+fn test_grep_multiline_and_escaped_newline_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    // Content spanning two lines: "hello unicorn\nrainbow world"
+    {
+        let mut f = std::fs::File::create(base.join("multi.txt")).unwrap();
+        writeln!(f, "hello unicorn").unwrap();
+        writeln!(f, "rainbow world").unwrap();
+    }
+    // Content with a literal double backslash before "nvim": `C:\\Users\\nvim-data`
+    {
+        let mut f = std::fs::File::create(base.join("winpath.rs")).unwrap();
+        writeln!(f, "let p = \"C:\\\\Users\\\\nvim-data\";").unwrap();
+    }
+    {
+        let mut f = std::fs::File::create(base.join("noise.txt")).unwrap();
+        writeln!(f, "nothing interesting here").unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let options = crate::GrepSearchOptions {
+        page_limit: 100,
+        max_matches_per_file: 0,
+        ..Default::default()
+    };
+
+    // 1. PlainText + `\n`: needle becomes a real newline, match spans two lines
+    let query = super::parse_grep_query("unicorn\\nrainbow");
+    let result = picker.grep(&query, &options);
+    assert_eq!(
+        result.files.len(),
+        1,
+        "multiline plaintext should match multi.txt"
+    );
+    assert_eq!(result.files[0].relative_path(&picker), "multi.txt");
+    let m = &result.matches[0];
+    assert_eq!(m.line_content, "hello unicorn");
+    // Auto after-context: the rest of the matched span is returned
+    assert_eq!(m.context_after, vec!["rainbow world"]);
+    // First needle segment highlighted as the line suffix
+    assert_eq!(m.match_byte_offsets.as_slice(), &[(6, 13)]);
+    assert_eq!(m.col, 6);
+
+    // 2. PlainText + `\\n`: literal backslash + n, must NOT be mangled to newline
+    let query = super::parse_grep_query("\\\\nvim-data");
+    let result = picker.grep(&query, &options);
+    assert_eq!(
+        result.files.len(),
+        1,
+        "escaped backslash should match winpath.rs literally"
+    );
+    assert_eq!(result.files[0].relative_path(&picker), "winpath.rs");
+    assert!(result.matches[0].line_content.contains("\\\\nvim-data"));
+    assert!(result.matches[0].context_after.is_empty());
+
+    // 3. Regex + `\n`: goes through the MultiLine searcher strategy
+    let regex_options = super::GrepSearchOptions {
+        mode: super::GrepMode::Regex,
+        ..options.clone()
+    };
+    let query = super::parse_grep_query("unicorn\\nrainbow");
+    let result = picker.grep(&query, &regex_options);
+    assert!(result.regex_fallback_error.is_none());
+    assert_eq!(
+        result.files.len(),
+        1,
+        "multiline regex should match multi.txt"
+    );
+    assert_eq!(result.files[0].relative_path(&picker), "multi.txt");
+    let m = &result.matches[0];
+    // Blob is normalized: single-line content + remaining lines as context
+    assert_eq!(m.line_content, "hello unicorn");
+    assert_eq!(m.context_after, vec!["rainbow world"]);
+    // Highlight clamped to the visible first line
+    assert_eq!(m.match_byte_offsets.as_slice(), &[(6, 13)]);
 }
 
 /// Regression test for issue #407: Live grep returns duplicate results
@@ -327,13 +511,15 @@ fn test_grep_no_duplicates_with_overflow_trailing_bits() {
         max_file_size: MAX_FFFILE_SIZE,
         max_matches_per_file: 0,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 100,
         mode: super::GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
     };
@@ -369,4 +555,135 @@ fn test_grep_no_duplicates_with_overflow_trailing_bits() {
         "expected exactly one match per file, got {}",
         result.matches.len()
     );
+}
+
+/// Issue #756: an AI-mode regex query with an inline FilePath scope and
+/// top-level alternation. The regex fragments are swallowed as bogus Glob
+/// constraints, the constrained search finds nothing, and the literal/regex
+/// fallback must NOT drop the FilePath scope — otherwise the `|` branch leaks
+/// matches into files outside the pinned path.
+#[test]
+fn regex_fallback_keeps_file_path_scope_issue_756() {
+    use fff_query_parser::{AiGrepConfig, QueryParser};
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir(base.join("scope")).unwrap();
+    std::fs::write(
+        base.join("scope").join("target.css"),
+        "/* ---------- target ---------- */\n",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("outside.css"),
+        "/* ---------- outside ---------- */\n",
+    )
+    .unwrap();
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let options = crate::GrepSearchOptions {
+        mode: super::GrepMode::Regex,
+        smart_case: true,
+        casing: None,
+        max_matches_per_file: 80,
+        page_limit: 100,
+        ..Default::default()
+    };
+
+    let raw = r"scope/target.css ^/\* |^\s*/\* ----------";
+    let query = QueryParser::new(AiGrepConfig).parse(raw);
+    let result = picker.grep(&query, &options);
+    let mut paths: Vec<String> = result
+        .files
+        .iter()
+        .map(|f| f.relative_path(&picker))
+        .collect();
+    paths.sort();
+
+    assert_eq!(
+        paths,
+        vec!["scope/target.css"],
+        "regex fallback must not leak outside the FilePath scope"
+    );
+}
+
+#[test]
+fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    // Only a/b/c carry the ASCII needle, so its bigrams stay below the
+    // ubiquity threshold that `compress` drops.
+    let base_contents: &[(&str, &str)] = &[
+        ("a.txt", "hello unicorn world"),
+        ("b.txt", "another unicorn line"),
+        ("c.txt", "one more unicorn here"),
+        ("d.txt", "nothing special in here"),
+        ("e.txt", "日本語のテキスト"),
+        ("f.txt", "rainbow sky above"),
+    ];
+    for (name, content) in base_contents {
+        let mut f = std::fs::File::create(base.join(name)).unwrap();
+        writeln!(f, "{}", content).unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    assert_eq!(picker.get_files().len(), base_contents.len());
+
+    let consec_builder = BigramIndexBuilder::new(base_contents.len());
+    let skip_builder = BigramIndexBuilder::new(base_contents.len());
+    for (i, (_, content)) in base_contents.iter().enumerate() {
+        consec_builder.add_file_content(&skip_builder, i, content.as_bytes());
+    }
+    // Compressed as build_bigram_index does, so this is the production prefilter.
+    let mut index = consec_builder.compress(None);
+    index.set_skip_index(skip_builder.compress(Some(
+        crate::index::bigram_filter::SKIP_INDEX_MIN_DENSITY_PCT,
+    )));
+    picker.set_bigram_index(index);
+
+    let options = crate::GrepSearchOptions {
+        mode: super::GrepMode::PlainText,
+        smart_case: true,
+        page_limit: 100,
+        ..Default::default()
+    };
+
+    let grep = |patterns: &[&str]| -> (Vec<String>, usize) {
+        let result = picker.multi_grep(patterns, &[], &options);
+        let mut paths: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path(&picker))
+            .collect();
+        paths.sort();
+        (paths, result.total_files_searched)
+    };
+
+    // The CJK needle has no printable-ASCII bigram, so nothing can be
+    // prefiltered: every file is searched and e.txt is found.
+    let (paths, searched) = grep(&["unicorn", "日本語"]);
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt", "e.txt"]);
+    assert_eq!(searched, base_contents.len());
+
+    // Every pattern indexable: only the files carrying some pattern's
+    // bigrams are searched, so the prefilter still narrows.
+    let (paths, searched) = grep(&["unicorn", "rainbow"]);
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt", "f.txt"]);
+    assert_eq!(searched, 4);
+    let (paths, searched) = grep(&["unicorn"]);
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
+    assert_eq!(searched, 3);
 }

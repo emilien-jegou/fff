@@ -1,26 +1,14 @@
-//! C FFI bindings for fff-core
+//! C FFI bindings for fff-core, usable from any language with C FFI
+//! (Bun, Node.js, Python, Ruby, etc.).
 //!
-//! This crate provides C-compatible FFI exports that can be used from any language
-//! with C FFI support (Bun, Node.js, Python, Ruby, etc.).
+//! All state is owned by an opaque instance handle: create with
+//! `fff_create_instance*`, pass to every call, free with `fff_destroy`.
+//! Multiple instances can coexist in one process.
 //!
-//! # Instance-based API
-//!
-//! All state is owned by an opaque `FffInstance` fff_handle. Callers create an instance
-//! with `fff_create_instance`, pass the fff_handle to every subsequent call, and free it with
-//! `fff_destroy`. Multiple independent instances can coexist in the same process.
-//!
-//! # Memory management
-//!
-//! * Every `fff_*` function that returns `*mut FffResult` requires the caller to
-//!   free the result with `fff_free_result`.
-//! * The instance itself must be freed with `fff_destroy`.
-//!
-//! # Parameter conventions
-//!
-//! * Optional `*const c_char` parameters: pass NULL or an empty string to omit.
-//! * Numeric parameters: 0 means "use default" unless documented otherwise.
-//! * Grep mode (`u8`): 0 = plain text, 1 = regex, 2 = fuzzy.
-//! * Multi-grep patterns are passed as a single newline-separated (`\n`) string.
+//! Conventions: every returned `*mut FffResult` is freed with
+//! `fff_free_result`; optional string params take NULL/empty; numeric 0 means
+//! "use default" unless documented otherwise; grep mode `u8` is 0 = plain
+//! text, 1 = regex, 2 = fuzzy; multi-grep patterns are `\n`-separated.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
@@ -30,6 +18,7 @@ use fff::shared::SharedQueryTracker;
 
 mod accessors;
 mod ffi_types;
+mod watch;
 
 use fff::file_picker::FilePicker;
 use fff::frecency::FrecencyTracker;
@@ -42,20 +31,17 @@ use ffi_types::{
     FffScore, FffSearchResult,
 };
 
-/// Opaque fff_handle holding all per-instance state.
-///
-/// The caller receives this as `*mut c_void` and must pass it to every FFI call.
-/// The fff_handle is freed by `fff_destroy`.
+/// Opaque handle holding all per-instance state; freed by `fff_destroy`.
 struct FffInstance {
     picker: SharedFilePicker,
     frecency: SharedFrecency,
     query_tracker: SharedQueryTracker,
+    // we keep a single callback type
+    watch_callback: std::sync::Arc<watch::WatchCallbackSlot>,
 }
 
-/// Helper to convert C string to Rust &str.
-///
-/// Returns `None` if the pointer is null or the string is not valid UTF-8.
-unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
+/// Convert a C string to `&str`; `None` if null or invalid UTF-8.
+pub(crate) unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
     if s.is_null() {
         None
     } else {
@@ -63,17 +49,15 @@ unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
     }
 }
 
-/// Helper to convert an optional C string parameter.
-///
-/// Returns `None` if the pointer is null, empty, or not valid UTF-8.
+/// Optional C string param: `None` if null, empty, or invalid UTF-8.
 unsafe fn optional_cstr<'a>(s: *const c_char) -> Option<&'a str> {
     unsafe { cstr_to_str(s) }.filter(|s| !s.is_empty())
 }
 
-/// Recover a `&FffInstance` from the opaque pointer.
-///
-/// Returns an error `FffResult` if the pointer is null.
-unsafe fn instance_ref<'a>(fff_handle: *mut c_void) -> Result<&'a FffInstance, *mut FffResult> {
+/// Recover a `&FffInstance` from the opaque pointer; error `FffResult` if null.
+pub(crate) unsafe fn instance_ref<'a>(
+    fff_handle: *mut c_void,
+) -> Result<&'a FffInstance, *mut FffResult> {
     if fff_handle.is_null() {
         Err(FffResult::err(
             "Instance handle is null. Create one with fff_create_instance first.",
@@ -107,11 +91,8 @@ fn default_i32(val: i32, default: i32) -> i32 {
 
 /// Create a new file finder instance (legacy 8-arg positional signature).
 ///
-/// @deprecated Use [`fff_create_instance_with`] (or
-/// [`fff_create_instance_with_value`] for FFI bindings) — both take the
-/// versioned [`FffCreateOptions`] struct that evolves without ABI breaks.
-/// This function delegates to `fff_create_instance_with` internally; the
-/// `use_unsafe_no_lock` parameter is deprecated and ignored.
+/// @deprecated Use [`fff_create_instance_with`] (or [`fff_create_instance_with_value`]
+/// for FFI bindings). The `use_unsafe_no_lock` parameter is ignored.
 ///
 /// ## Safety
 /// See `fff_create_instance_with`.
@@ -143,10 +124,8 @@ pub unsafe extern "C" fn fff_create_instance(
 
 /// Create a new file finder instance (legacy 13-arg positional signature).
 ///
-/// @deprecated Use [`fff_create_instance_with`] (or
-/// [`fff_create_instance_with_value`] for FFI bindings) — both take the
-/// versioned [`FffCreateOptions`] struct that evolves without ABI breaks.
-/// The `use_unsafe_no_lock` parameter is deprecated and ignored.
+/// @deprecated Use [`fff_create_instance_with`] (or [`fff_create_instance_with_value`]
+/// for FFI bindings). The `use_unsafe_no_lock` parameter is ignored.
 ///
 /// ## Safety
 /// See `fff_create_instance_with`.
@@ -186,22 +165,14 @@ pub unsafe extern "C" fn fff_create_instance2(
     unsafe { fff_create_instance_with(&opts as *const FffCreateOptions) }
 }
 
-/// Create a new file finder instance from an [`FffCreateOptions`] struct.
+/// Create a new file finder instance from a versioned [`FffCreateOptions`] struct.
 ///
-/// **Direct C consumers** populate the struct (designated initializers
-/// recommended), set `version` to [`FFF_CREATE_OPTIONS_VERSION`], and pass
-/// it by pointer. New fields are appended in future versions; old callers
-/// passing `version = 1` keep working forever.
+/// Populate the struct, set `version` to [`FFF_CREATE_OPTIONS_VERSION`], pass by
+/// pointer. New fields are only appended; older `version` values keep working.
+/// FFI bindings needing struct-by-value should use [`fff_create_instance_with_value`].
 ///
-/// **FFI consumers** that prefer struct-by-value semantics (e.g. ffi-rs's
-/// `paramsType: [structDef]`) should use [`fff_create_instance_with_value`]
-/// instead — it's a thin calling-convention adapter that delegates here.
-///
-/// Required: `opts.base_path` must be non-NULL and non-empty.
-///
-/// When all three `cache_budget_*` values are 0 the budget is auto-computed
-/// from repo size after the initial scan. Otherwise an explicit budget is
-/// used: any field left at 0 falls back to its `unlimited()` default.
+/// `opts.base_path` is required (non-NULL, non-empty). Zero `cache_budget_*`
+/// values are auto-computed from repo size after the initial scan.
 ///
 /// ## Safety
 /// * `opts` must be a valid pointer to an `FffCreateOptions` whose `version`
@@ -295,6 +266,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
             follow_symlinks: opts.version >= 2 && opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
+            git_recency: Default::default(),
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -304,22 +276,15 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
         picker: shared_picker,
         frecency: shared_frecency,
         query_tracker,
+        watch_callback: std::sync::Arc::new(watch::WatchCallbackSlot::default()),
     });
 
     let fff_handle = Box::into_raw(instance) as *mut c_void;
     FffResult::ok_handle(fff_handle)
 }
 
-/// Calling-convention adapter for [`fff_create_instance_with`].
-///
-/// Same logic, but takes the [`FffCreateOptions`] struct **by value**. This
-/// makes the function callable from FFI libraries whose native struct
-/// support passes structs by value on the wire (e.g. Node's `ffi-rs` with
-/// `paramsType: [structDef]`).
-///
-/// This is **not** a versioned wrapper — when new fields are appended to
-/// `FffCreateOptions`, both this function and `fff_create_instance_with`
-/// pick them up automatically with no signature change.
+/// [`fff_create_instance_with`] adapter taking [`FffCreateOptions`] **by value**,
+/// for FFI libraries that pass native structs by value (e.g. Node's `ffi-rs`).
 ///
 /// ## Safety
 /// All `*const c_char` fields inside `opts` must be valid null-terminated
@@ -341,6 +306,10 @@ pub unsafe extern "C" fn fff_destroy(fff_handle: *mut c_void) {
 
     let instance = unsafe { Box::from_raw(fff_handle as *mut FffInstance) };
 
+    // The C callback and user_data may be freed as soon as this returns.
+    instance.picker.shutdown_watches_and_wait();
+    instance.watch_callback.clear();
+
     if let Ok(mut guard) = instance.picker.write()
         && let Some(picker) = guard.take()
     {
@@ -357,16 +326,8 @@ pub unsafe extern "C" fn fff_destroy(fff_handle: *mut c_void) {
 
 /// Perform fuzzy search on indexed files.
 ///
-/// # Parameters
-///
-/// * `fff_handle`              – instance from `fff_create_instance`
-/// * `query`                   – search query string
-/// * `current_file`            – path of the currently open file for deprioritization (NULL/empty to skip)
-/// * `max_threads`             – maximum worker threads (0 = auto-detect)
-/// * `page_index`              – pagination offset (0 = first page)
-/// * `page_size`               – results per page (0 = default 100)
-/// * `combo_boost_multiplier`  – score multiplier for combo matches (0 = default 100)
-/// * `min_combo_count`         – minimum combo count before boost applies (0 = default 3)
+/// `current_file` deprioritizes the currently open file (NULL/empty to skip).
+/// Zero picks the default: `max_threads` auto, `page_size` 100.
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -379,8 +340,6 @@ pub unsafe extern "C" fn fff_search(
     max_threads: u32,
     page_index: u32,
     page_size: u32,
-    combo_boost_multiplier: i32,
-    min_combo_count: u32,
 ) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
@@ -394,8 +353,6 @@ pub unsafe extern "C" fn fff_search(
 
     let current_file_str = unsafe { optional_cstr(current_file) };
     let page_size = default_u32(page_size, 100) as usize;
-    let min_combo_count = default_u32(min_combo_count, 3);
-    let combo_boost_multiplier = default_i32(combo_boost_multiplier, 100);
 
     let picker_guard = match inst.picker.read() {
         Ok(g) => g,
@@ -409,25 +366,16 @@ pub unsafe extern "C" fn fff_search(
         }
     };
 
-    // Get query tracker ref for combo matching
-    let qt_guard = match inst.query_tracker.read() {
-        Ok(q) => q,
-        Err(_) => return FffResult::err("Failed to acquire query tracker lock"),
-    };
-    let query_tracker_ref = qt_guard.as_ref();
-
     let parser = QueryParser::default();
     let parsed = parser.parse(query_str);
 
     let results = picker.fuzzy_search(
         &parsed,
-        query_tracker_ref,
+        None,
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
-            combo_boost_score_multiplier: combo_boost_multiplier,
-            min_combo_count,
+            project_path: Some(picker.shared_base_path()),
             pagination: PaginationArgs {
                 offset: page_index as usize,
                 limit: page_size,
@@ -439,22 +387,11 @@ pub unsafe extern "C" fn fff_search(
     FffResult::ok_handle(search_result as *mut c_void)
 }
 
-/// Glob-only search: filter indexed files by a single glob pattern, rank by
-/// frecency, and paginate. Bypasses the regular query parser entirely.
+/// Glob-only search: filter indexed files by a single glob pattern (passed
+/// through verbatim, no query parsing), rank by frecency, and paginate.
 ///
-/// Use this when you already have a literal glob pattern (e.g. `*.rs`, a
-/// recursive `**` match, or `src/components` prefix) and want neither fuzzy
-/// matching nor multi-token constraint parsing. Ranking falls back to
-/// frecency because there is no fuzzy score to combine with.
-///
-/// # Parameters
-///
-/// * `fff_handle`   - instance from `fff_create_instance`
-/// * `pattern`      - glob pattern (required, no parsing - passed through verbatim)
-/// * `current_file` - path of the currently open file for deprioritization (NULL/empty to skip)
-/// * `max_threads`  - maximum worker threads (0 = auto-detect)
-/// * `page_index`   - pagination offset (0 = first page)
-/// * `page_size`    - results per page (0 = default 100)
+/// `current_file` deprioritizes the currently open file (NULL/empty to skip).
+/// Zero picks the default: `max_threads` auto, `page_size` 100.
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -498,9 +435,7 @@ pub unsafe extern "C" fn fff_glob(
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
-            combo_boost_score_multiplier: 0,
-            min_combo_count: 0,
+            project_path: Some(picker.shared_base_path()),
             pagination: PaginationArgs {
                 offset: page_index as usize,
                 limit: page_size,
@@ -514,14 +449,8 @@ pub unsafe extern "C" fn fff_glob(
 
 /// Perform fuzzy search on indexed directories.
 ///
-/// # Parameters
-///
-/// * `fff_handle`   – instance from `fff_create_instance`
-/// * `query`        – search query string
-/// * `current_file` – path of the currently open file for distance scoring (NULL/empty to skip)
-/// * `max_threads`  – maximum worker threads (0 = auto-detect)
-/// * `page_index`   – pagination offset (0 = first page)
-/// * `page_size`    – results per page (0 = default 100)
+/// `current_file` is used for distance scoring (NULL/empty to skip).
+/// Zero picks the default: `max_threads` auto, `page_size` 100.
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -568,9 +497,7 @@ pub unsafe extern "C" fn fff_search_directories(
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
-            combo_boost_score_multiplier: 0,
-            min_combo_count: 0,
+            project_path: Some(picker.shared_base_path()),
             pagination: PaginationArgs {
                 offset: page_index as usize,
                 limit: page_size,
@@ -584,20 +511,8 @@ pub unsafe extern "C" fn fff_search_directories(
 
 /// Perform a mixed fuzzy search across both files and directories.
 ///
-/// Returns a single flat list where files and directories are interleaved
-/// by total score in descending order. Each item has an `item_type` field
-/// (0 = file, 1 = directory).
-///
-/// # Parameters
-///
-/// * `fff_handle`              – instance from `fff_create_instance`
-/// * `query`                   – search query string
-/// * `current_file`            – path of the currently open file (NULL/empty to skip)
-/// * `max_threads`             – maximum worker threads (0 = auto-detect)
-/// * `page_index`              – pagination offset (0 = first page)
-/// * `page_size`               – results per page (0 = default 100)
-/// * `combo_boost_multiplier`  – score multiplier for combo matches (0 = default 100)
-/// * `min_combo_count`         – minimum combo count before boost applies (0 = default 3)
+/// Returns one flat list interleaved by descending total score; each item's
+/// `item_type` is 0 = file, 1 = directory. Parameters as in [`fff_search`].
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -610,8 +525,6 @@ pub unsafe extern "C" fn fff_search_mixed(
     max_threads: u32,
     page_index: u32,
     page_size: u32,
-    combo_boost_multiplier: i32,
-    min_combo_count: u32,
 ) -> *mut FffResult {
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
@@ -625,8 +538,6 @@ pub unsafe extern "C" fn fff_search_mixed(
 
     let current_file_str = unsafe { optional_cstr(current_file) };
     let page_size = default_u32(page_size, 100) as usize;
-    let min_combo_count = default_u32(min_combo_count, 3);
-    let combo_boost_multiplier = default_i32(combo_boost_multiplier, 100);
 
     let picker_guard = match inst.picker.read() {
         Ok(g) => g,
@@ -640,24 +551,16 @@ pub unsafe extern "C" fn fff_search_mixed(
         }
     };
 
-    let qt_guard = match inst.query_tracker.read() {
-        Ok(q) => q,
-        Err(_) => return FffResult::err("Failed to acquire query tracker lock"),
-    };
-    let query_tracker_ref = qt_guard.as_ref();
-
     let parser = QueryParser::new(fff_query_parser::MixedSearchConfig);
     let parsed = parser.parse(query_str);
 
     let results = picker.fuzzy_search_mixed(
         &parsed,
-        query_tracker_ref,
+        None,
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
-            combo_boost_score_multiplier: combo_boost_multiplier,
-            min_combo_count,
+            project_path: Some(picker.shared_base_path()),
             pagination: PaginationArgs {
                 offset: page_index as usize,
                 limit: page_size,
@@ -671,20 +574,12 @@ pub unsafe extern "C" fn fff_search_mixed(
 
 /// Perform content search (grep) across indexed files.
 ///
-/// # Parameters
-///
-/// * `fff_handle`            – instance from `fff_create_instance`
-/// * `query`                 – search query (supports constraint syntax like `*.rs pattern`)
-/// * `mode`                  – 0 = plain text (SIMD), 1 = regex, 2 = fuzzy
-/// * `max_file_size`         – skip files larger than this in bytes (0 = default 10 MB)
-/// * `max_matches_per_file`  – max matches per file (0 = unlimited)
-/// * `smart_case`            – case-insensitive when query is all lowercase
-/// * `file_offset`           – file-based pagination offset (0 = start)
-/// * `page_limit`            – max matches to return (0 = default 50)
-/// * `time_budget_ms`        – wall-clock budget in ms (0 = unlimited)
-/// * `before_context`        – context lines before each match
-/// * `after_context`         – context lines after each match
-/// * `classify_definitions`  – tag matches that are code definitions
+/// `query` supports constraint syntax like `*.rs pattern`; `mode` is
+/// 0 = plain text (SIMD), 1 = regex, 2 = fuzzy. Zero picks the default:
+/// `max_file_size` 10 MB, `page_limit` 50, `max_matches_per_file` and
+/// `time_budget_ms` unlimited. `smart_case` is case-insensitive for
+/// all-lowercase queries. `classify_definitions`: 0 = off, 1 = classify,
+/// 2 = definition_only, 3 = usage_only.
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -702,8 +597,53 @@ pub unsafe extern "C" fn fff_live_grep(
     time_budget_ms: u64,
     before_context: u32,
     after_context: u32,
-    classify_definitions: bool,
+    classify_definitions: u8,
 ) -> *mut FffResult {
+    unsafe {
+        fff_live_grep_ex(
+            fff_handle,
+            query,
+            mode,
+            max_file_size,
+            max_matches_per_file,
+            smart_case,
+            file_offset,
+            page_limit,
+            time_budget_ms,
+            false,
+            before_context,
+            after_context,
+            classify_definitions,
+        )
+    }
+}
+
+/// [`fff_live_grep`] plus `enforce_time_budget`: when true the budget also bounds
+/// zero-match searches and `next_file_offset` resumes at the first unsearched file.
+///
+/// ## Safety
+/// Same as [`fff_live_grep`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_live_grep_ex(
+    fff_handle: *mut c_void,
+    query: *const c_char,
+    mode: u8,
+    max_file_size: u64,
+    max_matches_per_file: u32,
+    smart_case: bool,
+    file_offset: u32,
+    page_limit: u32,
+    time_budget_ms: u64,
+    enforce_time_budget: bool,
+    before_context: u32,
+    after_context: u32,
+    classify_definitions: u8,
+) -> *mut FffResult {
+    let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
+        return FffResult::err(
+            "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
+        );
+    };
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -737,10 +677,12 @@ pub unsafe extern "C" fn fff_live_grep(
         max_file_size: default_u64(max_file_size, 10 * 1024 * 1024),
         max_matches_per_file: max_matches_per_file as usize,
         smart_case,
+        casing: None,
         file_offset: file_offset as usize,
         page_limit: default_u32(page_limit, 50) as usize,
         mode: grep_mode_from_u8(mode),
         time_budget_ms,
+        enforce_time_budget,
         before_context: before_context as usize,
         after_context: after_context as usize,
         classify_definitions,
@@ -753,25 +695,11 @@ pub unsafe extern "C" fn fff_live_grep(
     FffResult::ok_handle(grep_result as *mut c_void)
 }
 
-/// Perform multi-pattern OR search (Aho-Corasick) across indexed files.
+/// Multi-pattern OR search (SIMD Aho-Corasick): lines matching ANY pattern.
 ///
-/// Searches for lines matching ANY of the provided patterns using
-/// SIMD-accelerated multi-needle matching.
-///
-/// # Parameters
-///
-/// * `fff_handle`              – instance from `fff_create_instance`
-/// * `patterns_joined`         – patterns separated by `\n` (e.g. `"foo\nbar\nbaz"`)
-/// * `constraints`             – file filter like `"*.rs"` or `"/src/"` (NULL/empty to skip)
-/// * `max_file_size`           – skip files larger than this in bytes (0 = default 10 MB)
-/// * `max_matches_per_file`    – max matches per file (0 = unlimited)
-/// * `smart_case`              – case-insensitive when all patterns are lowercase
-/// * `file_offset`             – file-based pagination offset (0 = start)
-/// * `page_limit`              – max matches to return (0 = default 50)
-/// * `time_budget_ms`          – wall-clock budget in ms (0 = unlimited)
-/// * `before_context`          – context lines before each match
-/// * `after_context`           – context lines after each match
-/// * `classify_definitions`    – tag matches that are code definitions
+/// `patterns_joined` is `\n`-separated (e.g. `"foo\nbar"`); `constraints` is an
+/// optional file filter like `"*.rs"` or `"/src/"` (NULL/empty to skip).
+/// Remaining parameters as in [`fff_live_grep`].
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -789,8 +717,52 @@ pub unsafe extern "C" fn fff_multi_grep(
     time_budget_ms: u64,
     before_context: u32,
     after_context: u32,
-    classify_definitions: bool,
+    classify_definitions: u8,
 ) -> *mut FffResult {
+    unsafe {
+        fff_multi_grep_ex(
+            fff_handle,
+            patterns_joined,
+            constraints,
+            max_file_size,
+            max_matches_per_file,
+            smart_case,
+            file_offset,
+            page_limit,
+            time_budget_ms,
+            false,
+            before_context,
+            after_context,
+            classify_definitions,
+        )
+    }
+}
+
+/// [`fff_multi_grep`] plus `enforce_time_budget`, as in [`fff_live_grep_ex`].
+///
+/// ## Safety
+/// Same as [`fff_multi_grep`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_multi_grep_ex(
+    fff_handle: *mut c_void,
+    patterns_joined: *const c_char,
+    constraints: *const c_char,
+    max_file_size: u64,
+    max_matches_per_file: u32,
+    smart_case: bool,
+    file_offset: u32,
+    page_limit: u32,
+    time_budget_ms: u64,
+    enforce_time_budget: bool,
+    before_context: u32,
+    after_context: u32,
+    classify_definitions: u8,
+) -> *mut FffResult {
+    let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
+        return FffResult::err(
+            "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
+        );
+    };
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -820,19 +792,12 @@ pub unsafe extern "C" fn fff_multi_grep(
         }
     };
 
-    let is_ai = picker.mode().is_ai();
-
     // Parse constraints from the optional string (e.g. "*.rs /src/")
-    let parsed_constraints = constraints_str.map(|c| {
-        if is_ai {
-            fff::QueryParser::new(fff_query_parser::AiGrepConfig).parse(c)
-        } else {
-            fff::grep::parse_grep_query(c)
-        }
-    });
+    let parsed_constraints = constraints_str
+        .map(|c| fff::QueryParser::new(fff_query_parser::AiGrepConfig).parse_constraints(c));
 
     let constraint_refs: &[fff::Constraint<'_>] = match &parsed_constraints {
-        Some(q) => &q.constraints,
+        Some(constraints) => constraints,
         None => &[],
     };
 
@@ -840,10 +805,12 @@ pub unsafe extern "C" fn fff_multi_grep(
         max_file_size: default_u64(max_file_size, 10 * 1024 * 1024),
         max_matches_per_file: max_matches_per_file as usize,
         smart_case,
+        casing: None,
         file_offset: file_offset as usize,
         page_limit: default_u32(page_limit, 50) as usize,
         mode: fff::GrepMode::PlainText, // ignored by multi_grep_search
         time_budget_ms,
+        enforce_time_budget,
         before_context: before_context as usize,
         after_context: after_context as usize,
         classify_definitions,
@@ -893,10 +860,8 @@ pub unsafe extern "C" fn fff_is_scanning(fff_handle: *mut c_void) -> bool {
         .unwrap_or(false)
 }
 
-/// Get the base path of the file picker.
-///
-/// Returns an `FffResult` with a heap-allocated C string in the `handle`
-/// field. Free the string with `fff_free_string` after reading it.
+/// Get the picker's base path as a heap C string in `handle`;
+/// free it with `fff_free_string`.
 ///
 /// ## Safety
 /// `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -1032,6 +997,10 @@ pub unsafe extern "C" fn fff_restart_index(
         } else {
             (false, true, true, FFFMode::default(), false, false, false)
         };
+    let git_recency = guard
+        .as_ref()
+        .map(|p| p.git_recency_config())
+        .unwrap_or_default();
 
     drop(guard);
 
@@ -1048,6 +1017,7 @@ pub unsafe extern "C" fn fff_restart_index(
             follow_symlinks,
             enable_fs_root_scanning: fs_root,
             enable_home_dir_scanning: home_dir,
+            git_recency,
         },
     ) {
         Ok(()) => FffResult::ok_empty(),
@@ -1103,13 +1073,16 @@ pub unsafe extern "C" fn fff_track_query(
         Err(e) => return FffResult::err(&format!("Failed to canonicalize path: {}", e)),
     };
 
-    let project_path = {
+    let (project_path, file_path) = {
         let guard = match inst.picker.read() {
             Ok(g) => g,
             Err(_) => return FffResult::ok_int(0),
         };
         match guard.as_ref() {
-            Some(p) => p.base_path().to_path_buf(),
+            Some(p) => (
+                p.shared_base_path().to_path_buf(),
+                p.shared_path_for(&file_path).unwrap_or(file_path),
+            ),
             None => return FffResult::ok_int(0),
         }
     };
@@ -1148,7 +1121,7 @@ pub unsafe extern "C" fn fff_get_historical_query(
             Err(_) => return FffResult::ok_empty(),
         };
         match guard.as_ref() {
-            Some(p) => p.base_path().to_path_buf(),
+            Some(p) => p.shared_base_path().to_path_buf(),
             None => return FffResult::ok_empty(),
         }
     };
@@ -1358,10 +1331,8 @@ pub unsafe extern "C" fn fff_health_check(
     }
 }
 
-/// Free a search result returned by `fff_search`.
-///
-/// This frees the `FffSearchResult` struct, its `items` and `scores` arrays,
-/// and all heap-allocated strings within each item and score.
+/// Free a search result returned by `fff_search`: the struct, its `items`
+/// and `scores` arrays, and every string within.
 ///
 /// ## Safety
 /// `result` must be a valid pointer previously returned via `FffResult.handle`
@@ -1391,10 +1362,8 @@ pub unsafe extern "C" fn fff_free_search_result(result: *mut FffSearchResult) {
     }
 }
 
-/// Get a pointer to the `index`-th `FffFileItem` in a search result.
-///
-/// Returns null if `result` is null or `index >= result->count`.
-/// The returned pointer is valid until the search result is freed.
+/// Pointer to the `index`-th `FffFileItem`; null if `result` is null or
+/// `index >= count`. Valid until the search result is freed.
 ///
 /// ## Safety
 /// `result` must be a valid `FffSearchResult` pointer from `fff_search`.
@@ -1413,10 +1382,8 @@ pub unsafe extern "C" fn fff_search_result_get_item(
     unsafe { result.items.add(index as usize) }
 }
 
-/// Get a pointer to the `index`-th `FffScore` in a search result.
-///
-/// Returns null if `result` is null or `index >= result->count`.
-/// The returned pointer is valid until the search result is freed.
+/// Pointer to the `index`-th `FffScore`; null if `result` is null or
+/// `index >= count`. Valid until the search result is freed.
 ///
 /// ## Safety
 /// `result` must be a valid `FffSearchResult` pointer from `fff_search`.
@@ -1435,10 +1402,8 @@ pub unsafe extern "C" fn fff_search_result_get_score(
     unsafe { result.scores.add(index as usize) }
 }
 
-/// Free a grep result returned by `fff_live_grep` or `fff_multi_grep`.
-///
-/// This frees the `FffGrepResult` struct, its `items` array, and all
-/// heap-allocated strings, match ranges, and context arrays within each match.
+/// Free a grep result returned by `fff_live_grep` or `fff_multi_grep`:
+/// the struct, its `items` array, and all strings/ranges/context within.
 ///
 /// ## Safety
 /// `result` must be a valid pointer previously returned via `FffResult.handle`
@@ -1465,10 +1430,8 @@ pub unsafe extern "C" fn fff_free_grep_result(result: *mut FffGrepResult) {
     }
 }
 
-/// Get a pointer to the `index`-th `FffGrepMatch` in a grep result.
-///
-/// Returns null if `result` is null or `index >= result->count`.
-/// The returned pointer is valid until the grep result is freed.
+/// Pointer to the `index`-th `FffGrepMatch`; null if `result` is null or
+/// `index >= count`. Valid until the grep result is freed.
 ///
 /// ## Safety
 /// `result` must be a valid `FffGrepResult` pointer from `fff_live_grep` or `fff_multi_grep`.
@@ -1499,10 +1462,8 @@ pub unsafe extern "C" fn fff_free_scan_progress(result: *mut FffScanProgress) {
     }
 }
 
-/// Offset a pointer by `byte_offset` bytes.
-///
-/// General-purpose utility for FFI consumers that need pointer arithmetic
-/// (e.g. iterating over arrays). Returns null if `base` is null.
+/// Offset a pointer by `byte_offset` bytes (FFI array iteration helper).
+/// Returns null if `base` is null.
 ///
 /// ## Safety
 /// The resulting pointer must be within the bounds of the original allocation.
@@ -1514,13 +1475,9 @@ pub unsafe extern "C" fn fff_ptr_offset(base: *const c_void, byte_offset: usize)
     unsafe { (base as *const u8).add(byte_offset) as *const c_void }
 }
 
-/// Free a result returned by any `fff_*` function.
-/// **IMPORTANT:** this doesn't clean the the internal handle, so it is safe to call right after
-/// you handle the error case.
-///
-/// Note: Many non-libffi implementations are not supporting struct-by-value returns, so it's more
-/// convenient to have pointer returned at most of the time, though allocating result for every call
-/// is annoying, so we just rely on the fact that our allocator is good enough.
+/// Free a result envelope returned by any `fff_*` function.
+/// **IMPORTANT:** the `handle` payload is NOT freed release it separately
+/// using handle specific cleaning methods (`fff_destroy`, `fff_free_search_result`, etc.).
 ///
 /// ## Safety
 /// `result_ptr` must be a valid pointer returned by a `fff_*` function.
@@ -1535,9 +1492,8 @@ pub unsafe extern "C" fn fff_free_result(result_ptr: *mut FffResult) {
         if !result.error.is_null() {
             drop(CString::from_raw(result.error));
         }
-        // Note: `handle` is NOT freed here — the caller must free it
-        // with the appropriate function (fff_destroy, fff_free_search_result,
-        // fff_free_grep_result, fff_free_string, fff_free_scan_progress, etc.).
+
+        // note: handle is not freed by design
     }
 }
 

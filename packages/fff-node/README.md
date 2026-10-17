@@ -29,6 +29,20 @@ The correct native binary for your platform is installed automatically via platf
 
 If the platform package isn't available, the postinstall script will attempt to download from GitHub releases as a fallback.
 
+### Platforms without a prebuilt package
+
+On a platform that has no `@ff-labs/fff-bin-*` package (e.g. FreeBSD), build the C
+library from source and point `@ff-labs/fff-node` at it with `FFF_C_LIB`:
+
+```bash
+cargo build --release -p fff-c
+FFF_C_LIB=target/release/libfff_c.so node ./app.mjs
+```
+
+`FFF_C_LIB` is checked before the platform package and the local dev build. If the
+path does not exist, resolution fails with an explicit error rather than silently
+falling back. `ffi-rs` has no FreeBSD prebuilt either and must be built from source.
+
 ## Quick Start
 
 Each `FileFinder` instance owns an independent native index. Create one, wait
@@ -74,6 +88,59 @@ if (dirs.ok) console.log(dirs.value.items.map((d) => d.relativePath));
 finder.destroy();
 ```
 
+## Watching files
+
+Subscribe to filesystem changes with a glob, an exact path, or a directory
+subtree. Events reflect applied index changes and are delivered in batches of
+up to 128, so callbacks stay cheap even under heavy churn.
+
+```typescript
+// Each path appears at most once per batch
+const sub = finder.watch("src/**/*.ts", (events) => {
+  for (const e of events) console.log(e.kind, e.path); // created | modified | removed | renamed | rescan
+});
+
+// No pattern: watch the entire indexed tree
+const all = finder.watch((events) => {
+  for (const e of events) console.log(e.kind, e.path);
+});
+
+// Unsubscribe: call the handle
+if (sub.ok) sub.value();
+```
+
+Directory subtrees are watched by passing the directory itself (parcel-watcher
+style), with per-subscription excludes:
+
+```typescript
+const dirSub = finder.watch(
+  projectRoot,
+  (events) => {
+    for (const e of events) console.log(e.kind, e.path);
+  },
+  { ignore: ["node_modules", "*.log"] },
+);
+```
+
+Notes:
+
+- Globs are matched against the base-path-relative path; absolute globs must
+  live under `basePath`. Wildcard-free patterns resolve inside the indexed
+  tree: an existing directory watches its whole subtree, anything else is an
+  exact file path.
+- `ignore` entries exclude matches per subscription: wildcards are globs,
+  everything else is a path prefix (a file or a whole subtree).
+- Gitignored paths never produce events.
+- A `renamed` event carries both paths: `e.path` is the destination and
+  `e.from` the source. It replaces the removed/created pair, so a move is one
+  event. Moves in or out of the indexed tree stay a plain `created`/`removed`.
+- A `rescan` event means changes were lost (index overflow, ignore-file
+  change) — re-stat anything you care about.
+- Unsubscribing takes effect synchronously on the JS thread: once it
+  returns, the callback will not be invoked again.
+- Watching requires the instance to be created with watching enabled
+  (the default).
+
 ## API Reference
 
 Verify the latest API in the local interface at [`./src/fff-api.ts`](./src/fff-api.ts). Every field and type is documented.
@@ -102,8 +169,8 @@ If prebuilt binaries aren't available for your platform:
 
 ```bash
 # Clone the repository
-git clone https://github.com/dmtrKovalenko/fff.nvim
-cd fff.nvim
+git clone https://github.com/dmtrKovalenko/fff
+cd fff
 
 # Build the C library
 cargo build --release -p fff-c

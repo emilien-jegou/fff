@@ -6,8 +6,8 @@ use fff::path_utils::expand_tilde;
 use fff::query_tracker::QueryTracker;
 use fff::{
     DbHealthChecker, DirSearchConfig, Error, FFFMode, FFFQuery, FileSearchConfig,
-    FuzzySearchOptions, MixedSearchConfig, PaginationArgs, QueryParser, Score, SearchResult,
-    SharedFilePicker, SharedFrecency, SharedQueryTracker,
+    FuzzySearchOptions, GitRecencyConfig, MixedSearchConfig, PaginationArgs, QueryParser, Score,
+    SearchResult, SharedFilePicker, SharedFrecency, SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
 use mlua::prelude::*;
@@ -26,6 +26,19 @@ mod user_config;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+// Runs at load time, before mimalloc maps its first arena.
+#[used]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array")
+)]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func")
+)]
+#[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
+static TUNE_MIMALLOC: extern "C" fn() = fff::tune_mimalloc;
 
 // the global state for neovim lives here for efficiency
 // lua ffi is pretty bad with the overhead of converting raw pointer into tables
@@ -68,6 +81,7 @@ struct PickerInitOpts {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     enable_filename_constraint: bool,
+    git_recency: Option<GitRecencyConfig>,
 }
 
 impl PickerInitOpts {
@@ -92,10 +106,52 @@ impl PickerInitOpts {
                 enable_filename_constraint: t
                     .get::<Option<bool>>("enable_filename_constraint")?
                     .unwrap_or(false),
+                git_recency: Self::git_recency_from_lua(
+                    t.get::<Option<mlua::Value>>("git_recency")?,
+                )?,
             }),
             other => Err(LuaError::RuntimeError(format!(
                 "init opts must be a table, boolean, or nil — got {}",
                 other.type_name()
+            ))),
+        }
+    }
+
+    // Accepts a config table or a plain boolean (`recency = false` disables).
+    fn git_recency_from_lua(value: Option<mlua::Value>) -> LuaResult<Option<GitRecencyConfig>> {
+        let defaults = GitRecencyConfig::default();
+        match value {
+            None | Some(mlua::Value::Nil) => Ok(None),
+            Some(mlua::Value::Boolean(enabled)) => Ok(Some(GitRecencyConfig {
+                enabled,
+                ..defaults
+            })),
+            Some(mlua::Value::Table(t)) => Ok(Some(GitRecencyConfig {
+                enabled: t
+                    .get::<Option<bool>>("enabled")?
+                    .unwrap_or(defaults.enabled),
+                max_commits: Self::non_negative(&t, "max_commits")?.unwrap_or(defaults.max_commits),
+                max_files_per_commit: Self::non_negative(&t, "max_files_per_commit")?
+                    .unwrap_or(defaults.max_files_per_commit),
+            })),
+            Some(other) => Err(LuaError::RuntimeError(format!(
+                "git_recency must be a table, boolean, or nil — got {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    // Rejects invalid limits with the offending key named, instead of failing
+    // picker init with mlua's bare conversion error.
+    fn non_negative(t: &mlua::Table, key: &str) -> LuaResult<Option<usize>> {
+        match t.get::<Option<i64>>(key) {
+            Ok(None) => Ok(None),
+            Ok(Some(v)) if v >= 0 => Ok(Some(v as usize)),
+            Ok(Some(v)) => Err(LuaError::RuntimeError(format!(
+                "git_recency.{key} must be a non-negative integer — got {v}"
+            ))),
+            Err(e) => Err(LuaError::RuntimeError(format!(
+                "git_recency.{key} must be a non-negative integer — {e}"
             ))),
         }
     }
@@ -128,6 +184,7 @@ pub fn init_file_picker(
             follow_symlinks: opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
+            git_recency: opts.git_recency.unwrap_or_default(),
             ..Default::default()
         },
     )
@@ -175,7 +232,7 @@ pub fn restart_index_in_path(
         // Inherit current picker's scanning flags when caller didn't pass
         // explicit opts — otherwise a `:cd ~` after init would silently lose
         // the user's `enable_home_dir_scanning = true` setting.
-        let (follow_symlinks, fs_root, home_dir) = {
+        let (follow_symlinks, fs_root, home_dir, git_recency) = {
             let guard = match FILE_PICKER.read() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -193,11 +250,13 @@ pub fn restart_index_in_path(
                     p.follows_symlinks() || opts.follow_symlinks,
                     p.fs_root_scanning_enabled() || opts.enable_fs_root_scanning,
                     p.home_dir_scanning_enabled() || opts.enable_home_dir_scanning,
+                    opts.git_recency.unwrap_or_else(|| p.git_recency_config()),
                 ),
                 None => (
                     opts.follow_symlinks,
                     opts.enable_fs_root_scanning,
                     opts.enable_home_dir_scanning,
+                    opts.git_recency.unwrap_or_default(),
                 ),
             }
         };
@@ -220,6 +279,7 @@ pub fn restart_index_in_path(
                 follow_symlinks,
                 enable_fs_root_scanning: fs_root,
                 enable_home_dir_scanning: home_dir,
+                git_recency,
                 ..Default::default()
             },
         ) {
@@ -248,20 +308,10 @@ pub fn scan_files(_: &Lua, _: ()) -> LuaResult<()> {
 #[allow(clippy::type_complexity)]
 pub fn fuzzy_search_files(
     lua: &Lua,
-    (
-        query,
-        max_threads,
-        current_file,
-        combo_boost_score_multiplier,
-        min_combo_count,
-        page_index,
-        page_size,
-    ): (
+    (query, max_threads, current_file, page_index, page_size): (
         String,
         usize,
         Option<String>,
-        i32,
-        Option<u32>,
         Option<usize>,
         Option<usize>,
     ),
@@ -272,7 +322,6 @@ pub fn fuzzy_search_files(
     };
 
     let base_path = picker.base_path();
-    let min_combo_count = min_combo_count.unwrap_or(3);
 
     let query_tracker_guard = QUERY_TRACKER.read().into_lua_result()?;
 
@@ -283,7 +332,6 @@ pub fn fuzzy_search_files(
     tracing::debug!(
         ?base_path,
         ?query,
-        ?min_combo_count,
         ?page_index,
         ?page_size,
         "Fuzzy search parameters"
@@ -296,9 +344,7 @@ pub fn fuzzy_search_files(
         FuzzySearchOptions {
             max_threads,
             current_file: current_file.as_deref(),
-            project_path: Some(picker.base_path()),
-            combo_boost_score_multiplier,
-            min_combo_count,
+            project_path: Some(picker.shared_base_path()),
             pagination: PaginationArgs {
                 offset: page_index.unwrap_or(0),
                 limit: page_size.unwrap_or(0),
@@ -322,6 +368,7 @@ pub fn fuzzy_search_files(
                         match_type: "path",
                         ..Default::default()
                     }],
+                    match_byte_offsets: vec![Default::default()],
                     total_matched: 1,
                     total_files: results.total_files,
                     location: parsed_query.location,
@@ -361,9 +408,7 @@ pub fn fuzzy_search_directories(
         FuzzySearchOptions {
             max_threads,
             current_file: current_file.as_deref(),
-            project_path: Some(picker.base_path()),
-            combo_boost_score_multiplier: 0,
-            min_combo_count: 0,
+            project_path: Some(picker.shared_base_path()),
             pagination: PaginationArgs {
                 offset: page_index.unwrap_or(0),
                 limit: page_size.unwrap_or(0),
@@ -377,20 +422,10 @@ pub fn fuzzy_search_directories(
 #[allow(clippy::type_complexity)]
 pub fn fuzzy_search_mixed(
     lua: &Lua,
-    (
-        query,
-        max_threads,
-        current_file,
-        combo_boost_score_multiplier,
-        min_combo_count,
-        page_index,
-        page_size,
-    ): (
+    (query, max_threads, current_file, page_index, page_size): (
         String,
         usize,
         Option<String>,
-        i32,
-        Option<u32>,
         Option<usize>,
         Option<usize>,
     ),
@@ -410,9 +445,7 @@ pub fn fuzzy_search_mixed(
         FuzzySearchOptions {
             max_threads,
             current_file: current_file.as_deref(),
-            project_path: Some(picker.base_path()),
-            combo_boost_score_multiplier,
-            min_combo_count: min_combo_count.unwrap_or(3),
+            project_path: Some(picker.shared_base_path()),
             pagination: PaginationArgs {
                 offset: page_index.unwrap_or(0),
                 limit: page_size.unwrap_or(0),
@@ -423,60 +456,23 @@ pub fn fuzzy_search_mixed(
     lua_types::MixedSearchResultLua::new(results, picker).into_lua(lua)
 }
 
-#[allow(clippy::type_complexity)]
-pub fn live_grep(
-    lua: &Lua,
-    (
-        query,
-        file_offset,
-        page_size,
-        max_file_size,
-        max_matches_per_file,
-        smart_case,
-        grep_mode,
-        time_budget_ms,
-        trim_whitespace,
-    ): (
-        String,
-        Option<usize>,
-        Option<usize>,
-        Option<u64>,
-        Option<usize>,
-        Option<bool>,
-        Option<String>,
-        Option<u64>,
-        Option<bool>,
-    ),
-) -> LuaResult<LuaValue> {
-    let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
-    let Some(ref picker) = *file_picker_guard else {
-        return Err(error::to_lua_error(Error::FilePickerMissing));
-    };
+type GrepArgs = (
+    String,
+    Option<usize>,
+    Option<usize>,
+    Option<u64>,
+    Option<usize>,
+    Option<bool>,
+    Option<String>,
+    Option<u64>,
+    Option<bool>,
+    Option<bool>,
+    Option<String>,
+);
 
-    let parsed_query = FFFQuery::parse(&query, NvimGrepConfig);
-    let mode = match grep_mode.as_deref() {
-        Some("regex") => fff::GrepMode::Regex,
-        Some("fuzzy") => fff::GrepMode::Fuzzy,
-        _ => fff::GrepMode::PlainText, // "plain" or nil or unknown
-    };
-
-    let options = fff::GrepSearchOptions {
-        max_file_size: max_file_size.unwrap_or(10 * 1024 * 1024),
-        max_matches_per_file: max_matches_per_file.unwrap_or(200),
-        smart_case: smart_case.unwrap_or(true),
-        file_offset: file_offset.unwrap_or(0),
-        page_limit: page_size.unwrap_or(50),
-        mode,
-        time_budget_ms: time_budget_ms.unwrap_or(0),
-        before_context: 0,
-        after_context: 0,
-        classify_definitions: false,
-        trim_whitespace: trim_whitespace.unwrap_or(false),
-        abort_signal: None,
-    };
-
-    let result = picker.grep(&parsed_query, &options);
-    lua_types::GrepResultLua::new(result, picker).into_lua(lua)
+pub fn live_grep(lua: &Lua, args: GrepArgs) -> LuaResult<LuaValue> {
+    let (query, options) = parse_grep_args(args);
+    live_grep_with_options(lua, &query, &options)
 }
 
 /// Build a file-picker result for an absolute path that exists on disk but
@@ -499,6 +495,7 @@ fn build_file_path_fallback(lua: &Lua, path: &Path, total_files: usize) -> LuaRe
     item.set("modification_frecency_score", 0i32)?;
     item.set("total_frecency_score", 0i32)?;
     item.set("git_status", "")?;
+    item.set("git_recency_score", 0i32)?;
     item.set("is_binary", false)?;
 
     let items_table = lua.create_table()?;
@@ -508,13 +505,8 @@ fn build_file_path_fallback(lua: &Lua, path: &Path, total_files: usize) -> LuaRe
     let score = lua.create_table()?;
     score.set("total", 0)?;
     score.set("base_score", 0)?;
-    score.set("filename_bonus", 0)?;
-    score.set("special_filename_bonus", 0)?;
     score.set("frecency_boost", 0)?;
-    score.set("git_status_boost", 0)?;
-    score.set("distance_penalty", 0)?;
     score.set("current_file_penalty", 0)?;
-    score.set("combo_match_boost", 0)?;
     score.set("exact_match", true)?;
     score.set("match_type", "path")?;
 
@@ -534,6 +526,14 @@ pub fn track_access(_: &Lua, file_path: String) -> LuaResult<bool> {
     // prevent users from deadlock of the main thread if someone deletes a lock
     let file_path = PathBuf::from(&file_path);
     std::thread::spawn(move || {
+        // inside a linked git worktree the access also feeds the main checkout history
+        let shared_path = match FILE_PICKER.read() {
+            Ok(guard) => guard
+                .as_ref()
+                .and_then(|picker| picker.shared_path_for(&file_path)),
+            Err(_) => None,
+        };
+
         {
             let frecency_guard = match FRECENCY.read() {
                 Ok(g) => g,
@@ -545,7 +545,7 @@ pub fn track_access(_: &Lua, file_path: String) -> LuaResult<bool> {
             let Some(ref frecency) = *frecency_guard else {
                 return;
             };
-            if let Err(e) = frecency.track_access(file_path.as_path()) {
+            if let Err(e) = frecency.track_access_shared(&file_path, shared_path.as_deref()) {
                 ::tracing::debug!(?e, ?file_path, "track_access: frecency DB write failed");
                 return;
             }
@@ -595,6 +595,11 @@ pub fn get_scan_progress(lua: &Lua, _: ()) -> LuaResult<LuaValue> {
     let table = lua.create_table()?;
     table.set("scanned_files_count", progress.scanned_files_count)?;
     table.set("is_scanning", progress.is_scanning)?;
+    table.set("is_warmup_complete", progress.is_warmup_complete)?;
+    let is_index_ready =
+        picker.has_content_indexing() && picker.bigram_index().is_some() && !progress.is_scanning;
+
+    table.set("is_index_ready", is_index_ready)?;
     Ok(LuaValue::Table(table))
 }
 
@@ -622,11 +627,21 @@ pub fn refresh_git_status(_: &Lua, _: ()) -> LuaResult<usize> {
 
 pub fn get_file_access_count(_: &Lua, file_path: String) -> LuaResult<u64> {
     let path = PathBuf::from(&file_path);
+    let shared_path = FILE_PICKER
+        .read()
+        .into_lua_result()?
+        .as_ref()
+        .and_then(|picker| picker.shared_path_for(&path));
+
     let frecency_guard = FRECENCY.read().into_lua_result()?;
     let Some(ref frecency) = *frecency_guard else {
         return Ok(0);
     };
-    let count = frecency.access_count(&path).into_lua_result()?;
+    let mut count = frecency.access_count(&path).into_lua_result()?;
+    // worktree opens are mirrored into the shared history, so it already counts them
+    if let Some(shared_path) = shared_path {
+        count = count.max(frecency.access_count(&shared_path).into_lua_result()?);
+    }
     Ok(count as u64)
 }
 
@@ -675,28 +690,26 @@ pub fn cancel_scan(_: &Lua, _: ()) -> LuaResult<bool> {
 }
 
 pub fn track_query_completion(_: &Lua, (query, file_path): (String, String)) -> LuaResult<bool> {
-    // Everything runs on a background thread — including the
-    // `FILE_PICKER.read()` used to fetch `project_path`. Doing that read
-    // on the main (UI) thread stalled nvim whenever a reindex writer was
-    // in flight: parking_lot's fair queue makes a read block behind a
-    // pending writer, so the main thread would freeze for the full
-    // duration of the scan.
+    // Keep picker locks off the UI thread; a queued scan writer can block readers.
     let query_tracker = QUERY_TRACKER.clone();
     std::thread::spawn(move || {
-        let project_path = match FILE_PICKER.read() {
-            Ok(guard) => match *guard {
-                Some(ref picker) => picker.base_path().to_path_buf(),
-                None => return,
-            },
-            Err(_) => return,
-        };
-
         let file_path = match fff::path_utils::canonicalize(&file_path) {
             Ok(path) => path,
             Err(e) => {
                 tracing::warn!(?file_path, error = ?e, "Failed to canonicalize file path for tracking");
                 return;
             }
+        };
+
+        let (project_path, file_path) = match FILE_PICKER.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(picker) => (
+                    picker.shared_base_path().to_path_buf(),
+                    picker.shared_path_for(&file_path).unwrap_or(file_path),
+                ),
+                None => return,
+            },
+            Err(_) => return,
         };
 
         if let Ok(mut guard) = query_tracker.write()
@@ -721,7 +734,7 @@ pub fn get_historical_query(_: &Lua, offset: usize) -> LuaResult<Option<String>>
         let Some(ref picker) = *file_picker else {
             return Ok(None);
         };
-        picker.base_path().to_path_buf()
+        picker.shared_base_path().to_path_buf()
     };
 
     let query_tracker = QUERY_TRACKER.read().into_lua_result()?;
@@ -741,7 +754,7 @@ pub fn track_grep_query(_: &Lua, query: String) -> LuaResult<bool> {
     std::thread::spawn(move || {
         let project_path = match FILE_PICKER.read() {
             Ok(guard) => match *guard {
-                Some(ref picker) => picker.base_path().to_path_buf(),
+                Some(ref picker) => picker.shared_base_path().to_path_buf(),
                 None => return,
             },
             Err(_) => return,
@@ -768,7 +781,7 @@ pub fn get_historical_grep_query(_: &Lua, offset: usize) -> LuaResult<Option<Str
         let Some(ref picker) = *file_picker else {
             return Ok(None);
         };
-        picker.base_path().to_path_buf()
+        picker.shared_base_path().to_path_buf()
     };
 
     let query_tracker = QUERY_TRACKER.read().into_lua_result()?;
@@ -850,6 +863,12 @@ pub fn health_check(lua: &Lua, test_path: Option<String>) -> LuaResult<LuaValue>
                     "base_path",
                     picker.base_path().to_string_lossy().to_string(),
                 )?;
+                if picker.shared_base_path() != picker.base_path() {
+                    picker_info.set(
+                        "shared_base_path",
+                        picker.shared_base_path().to_string_lossy().to_string(),
+                    )?;
+                }
                 picker_info.set("is_scanning", picker.is_scan_active())?;
                 let progress = picker.get_scan_progress();
                 picker_info.set("indexed_files", progress.scanned_files_count)?;
@@ -974,7 +993,27 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
         "fuzzy_search_mixed",
         lua.create_function(fuzzy_search_mixed)?,
     )?;
-    exports.set("live_grep", lua.create_function(live_grep)?)?;
+    exports.set(
+        "live_grep",
+        lua.create_function(|lua, args: LuaMultiValue| {
+            let classify_definitions = match args.get(11) {
+                None | Some(LuaValue::Nil) => fff::DefinitionMode::Off,
+                Some(LuaValue::Boolean(enabled)) => (*enabled).into(),
+                Some(LuaValue::String(mode)) => fff::DefinitionMode::parse(&mode.to_str()?)
+                    .ok_or_else(|| {
+                        LuaError::RuntimeError("Invalid classify_definitions mode".into())
+                    })?,
+                _ => {
+                    return Err(LuaError::RuntimeError(
+                        "classify_definitions must be a mode string or boolean".into(),
+                    ));
+                }
+            };
+            let (query, mut options) = parse_grep_args(GrepArgs::from_lua_multi(args, lua)?);
+            options.classify_definitions = classify_definitions;
+            live_grep_with_options(lua, &query, &options)
+        })?,
+    )?;
     exports.set("track_access", lua.create_function(track_access)?)?;
     exports.set(
         "get_file_access_count",
@@ -1031,4 +1070,66 @@ fn fff_nvim(lua: &Lua) -> LuaResult<LuaTable> {
     crate::log::install_panic_hook();
 
     create_exports(lua)
+}
+
+fn parse_grep_args(
+    (
+        query,
+        file_offset,
+        page_size,
+        max_file_size,
+        max_matches_per_file,
+        smart_case,
+        grep_mode,
+        time_budget_ms,
+        trim_whitespace,
+        enforce_time_budget,
+        casing,
+    ): GrepArgs,
+) -> (String, fff::GrepSearchOptions) {
+    let mode = match grep_mode.as_deref() {
+        Some("regex") => fff::GrepMode::Regex,
+        Some("fuzzy") => fff::GrepMode::Fuzzy,
+        _ => fff::GrepMode::PlainText, // "plain" or nil or unknown
+    };
+    // nil/unknown falls back to the legacy smart_case toggle
+    let casing = match casing.as_deref() {
+        Some("smart") => Some(fff::Casing::Smart),
+        Some("sensitive") => Some(fff::Casing::Sensitive),
+        Some("insensitive") => Some(fff::Casing::Insensitive),
+        _ => None,
+    };
+
+    let options = fff::GrepSearchOptions {
+        max_file_size: max_file_size.unwrap_or(10 * 1024 * 1024),
+        max_matches_per_file: max_matches_per_file.unwrap_or(200),
+        smart_case: smart_case.unwrap_or(true),
+        casing,
+        file_offset: file_offset.unwrap_or(0),
+        page_limit: page_size.unwrap_or(50),
+        mode,
+        time_budget_ms: time_budget_ms.unwrap_or(0),
+        enforce_time_budget: enforce_time_budget.unwrap_or(false),
+        before_context: 0,
+        after_context: 0,
+        classify_definitions: Default::default(),
+        trim_whitespace: trim_whitespace.unwrap_or(false),
+        abort_signal: None,
+    };
+
+    (query, options)
+}
+
+fn live_grep_with_options(
+    lua: &Lua,
+    query: &str,
+    options: &fff::GrepSearchOptions,
+) -> LuaResult<LuaValue> {
+    let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
+    let Some(ref picker) = *file_picker_guard else {
+        return Err(error::to_lua_error(Error::FilePickerMissing));
+    };
+    let parsed_query = FFFQuery::parse(query, NvimGrepConfig);
+    let result = picker.grep(&parsed_query, options);
+    lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }

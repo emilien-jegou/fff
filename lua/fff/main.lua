@@ -28,7 +28,7 @@ end
 
 --- Live grep: search file contents in the current directory.
 --- When opts.resume is true, resumes the last live_grep picker (or opens a new one if none saved).
---- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides
+--- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, casing?: "smart"|"sensitive"|"insensitive", max_matches_per_file?: number, modes?: string[], classify_definitions?: boolean|FffDefinitionMode}, query?: string, resume?: boolean} Optional configuration overrides
 function M.live_grep(opts)
   local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
   if not picker_ok then
@@ -101,7 +101,13 @@ function M.clear_cache(scope)
 
   if scope == 'all' or scope == 'files' then
     local ok, err = pcall(fuzzy.cleanup_file_picker)
-    if not ok then table.insert(errors, 'cleanup file picker: ' .. tostring(err)) end
+    if not ok then
+      table.insert(errors, 'cleanup file picker: ' .. tostring(err))
+    else
+      -- Rust picker is gone; clear the core flag so the next ensure_initialized
+      -- rebuilds it instead of operating on a dropped picker (#772).
+      require('fff.core').mark_file_picker_uninitialized()
+    end
   end
 
   if scope == 'all' or scope == 'frecency' then
@@ -148,16 +154,11 @@ function M.search(query, max_results)
   local config = require('fff.conf').get()
   max_results = max_results or config.max_results
   local max_threads = config.max_threads or 4
-  local combo_boost_score_multiplier = config.history and config.history.combo_boost_score_multiplier or 100
-  local min_combo_count = config.history and config.history.min_combo_count or 3
-  -- Args: query, max_threads, current_file, combo_boost_score_multiplier, min_combo_count, offset, page_size
   local ok, search_result = pcall(
     fuzzy.fuzzy_search_files,
     query,
     max_threads,
     nil,
-    combo_boost_score_multiplier,
-    min_combo_count,
     0,
     max_results
   )
@@ -171,8 +172,6 @@ end
 --- @field page? number 0-based page index (default: 0).
 --- @field current_file? string Path to deprioritize (default: nil).
 --- @field max_threads? number Worker threads (default: config.max_threads).
---- @field combo_boost_score_multiplier? number Override history combo boost.
---- @field min_combo_count? number Override history min_combo_count.
 --- @field cwd? string If set and different from the current indexed root, switch the index to this directory before searching. Implies waiting for the new scan unless `wait_for_index_ms = 0`.
 --- @field wait_for_index_ms? number Block up to this many ms for the index to be ready (default: 10000 when `cwd` triggers a re-index, 0 otherwise). Set to 0 to never block.
 
@@ -283,16 +282,11 @@ function M.file_search(query, opts)
   local page_size = opts.max_results or config.max_results or 100
   local page_index = opts.page or 0
   local current_file = opts.current_file
-  local combo_boost = opts.combo_boost_score_multiplier
-    or (config.history and config.history.combo_boost_score_multiplier)
-    or 100
-  local min_combo = opts.min_combo_count or (config.history and config.history.min_combo_count) or 3
 
   local empty = { items = {}, scores = {}, total_matched = 0 }
   if mode == 'files' then
     local offset = page_index * page_size
-    local ok, result =
-      pcall(fuzzy.fuzzy_search_files, query, max_threads, current_file, combo_boost, min_combo, offset, page_size)
+    local ok, result = pcall(fuzzy.fuzzy_search_files, query, max_threads, current_file, offset, page_size)
     if not ok then
       vim.notify('FFF file_search failed: ' .. tostring(result), vim.log.levels.ERROR)
       return empty
@@ -306,8 +300,7 @@ function M.file_search(query, opts)
     end
     return result
   elseif mode == 'mixed' then
-    local ok, result =
-      pcall(fuzzy.fuzzy_search_mixed, query, max_threads, current_file, combo_boost, min_combo, page_index, page_size)
+    local ok, result = pcall(fuzzy.fuzzy_search_mixed, query, max_threads, current_file, page_index, page_size)
     if not ok then
       vim.notify('FFF file_search(mixed) failed: ' .. tostring(result), vim.log.levels.ERROR)
       return empty
@@ -319,14 +312,17 @@ function M.file_search(query, opts)
 end
 
 --- @class fff.ContentSearchOpts
---- @field mode? "plain"|"regex"|"fuzzy" Grep mode (default: 'plain').
+--- @field mode? FffGrepMode Grep mode (default: 'plain').
 --- @field max_file_size? number Skip files larger than N bytes (default: config.grep.max_file_size).
 --- @field max_matches_per_file? number Cap matches per file, 0 = unlimited (default: config.grep.max_matches_per_file).
 --- @field smart_case? boolean Case-insensitive when query is all lowercase (default: config.grep.smart_case).
+--- @field casing? "smart"|"sensitive"|"insensitive" Explicit case mode, overrides smart_case (default: config.grep.casing).
 --- @field page_size? number Max matches returned (default: 50).
 --- @field file_offset? number File-based pagination offset (default: 0).
 --- @field time_budget_ms? number Max wall-clock time, 0 = unlimited (default: config.grep.time_budget_ms).
+--- @field enforce_time_budget? boolean Apply the budget even with zero matches (default: config.grep.enforce_time_budget).
 --- @field trim_whitespace? boolean Strip leading whitespace from matched lines (default: config.grep.trim_whitespace).
+--- @field classify_definitions? boolean|FffDefinitionMode Classify matches or return definitions/usages only (default: config.grep.classify_definitions).
 --- @field cwd? string Switch indexed root before grepping (same semantics as `file_search`).
 --- @field wait_for_index_ms? number Block up to this many ms for the index to be ready.
 
@@ -343,8 +339,10 @@ function M.content_search(query, opts)
   opts = opts or {}
 
   local mode = opts.mode or 'plain'
-  if mode ~= 'plain' and mode ~= 'regex' and mode ~= 'fuzzy' then
-    error("fff.content_search: opts.mode must be 'plain', 'regex', or 'fuzzy', got " .. tostring(mode))
+  if mode ~= 'plain' and mode ~= 'regex' and mode ~= 'fuzzy' and mode ~= 'definition_only' then
+    error(
+      "fff.content_search: opts.mode must be 'plain', 'regex', 'fuzzy', or 'definition_only', got " .. tostring(mode)
+    )
   end
 
   local empty = {
@@ -369,9 +367,15 @@ function M.content_search(query, opts)
     max_file_size = opts.max_file_size or grep_cfg.max_file_size,
     max_matches_per_file = opts.max_matches_per_file or grep_cfg.max_matches_per_file,
     smart_case = opts.smart_case == nil and grep_cfg.smart_case or opts.smart_case,
+    casing = opts.casing == nil and grep_cfg.casing or opts.casing,
     time_budget_ms = opts.time_budget_ms or grep_cfg.time_budget_ms,
+    enforce_time_budget = opts.enforce_time_budget == nil and grep_cfg.enforce_time_budget or opts.enforce_time_budget,
     trim_whitespace = opts.trim_whitespace == nil and grep_cfg.trim_whitespace or opts.trim_whitespace,
+    classify_definitions = opts.classify_definitions,
   }
+  if merged_grep_cfg.classify_definitions == nil then
+    merged_grep_cfg.classify_definitions = grep_cfg.classify_definitions
+  end
 
   local ok, result = pcall(grep.search, query, opts.file_offset or 0, opts.page_size or 50, merged_grep_cfg, mode)
   if not ok then

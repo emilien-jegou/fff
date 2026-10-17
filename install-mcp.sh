@@ -2,20 +2,20 @@
 set -eo pipefail
 
 # FFF MCP Server installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff/main/install-mcp.sh | bash
 
-REPO="dmtrKovalenko/fff.nvim"
+REPO="dmtrKovalenko/fff"
 BINARY_NAME="fff-mcp"
 INSTALL_DIR="${FFF_MCP_INSTALL_DIR:-$HOME/.local/bin}"
 
-PINNED_RELEASE_TAG="v0.9.6"
+PINNED_RELEASE_TAG="v0.11.0"
 
-SHA256_X86_64_UNKNOWN_LINUX_MUSL="102ceaf173ef776becb3322216e9f6b5caef997c400c5d15f112ce4de40a1f5a"
-SHA256_AARCH64_UNKNOWN_LINUX_MUSL="a9810c9056afa6d9e8ac1e7a3f1f15f8ecbfdc16a592e9d26e4b2434ef97a675"
-SHA256_X86_64_APPLE_DARWIN="58259324c2c13a1b6f24f13138c2cd3eae9ff20e05201a539beb8f2044a651aa"
-SHA256_AARCH64_APPLE_DARWIN="29a7fadeafb062f3e5954b1ab8c69e14dca24f5e061cd8d3b1ea1bab385a3754"
-SHA256_X86_64_PC_WINDOWS_MSVC="7ff688d034aa42ff779a61ad12689794bdc253c895152796046f374390fb9cad"
-SHA256_AARCH64_PC_WINDOWS_MSVC="94ce316a38775d8ed3b32882d8ef45560740319de8d7ac7bb80c31887b3afb6d"
+SHA256_X86_64_UNKNOWN_LINUX_MUSL="d1e8671f40c89c445aaa1728a21ec04b74be2e5f99091485caeabcc97f99aceb"
+SHA256_AARCH64_UNKNOWN_LINUX_MUSL="35f8e05d6c865266bf451d13bfa5e1b0d98438fda7dc1c9bdbc1c6a83484577d"
+SHA256_X86_64_APPLE_DARWIN="33377a8f96442ebc8b06d3bd2863cf66a520f97a33700e0fb85a09dd7988e862"
+SHA256_AARCH64_APPLE_DARWIN="cc606d9418cfa7764376dcd7b32a33e6459a6cb9a4718be366b024dca6e9fead"
+SHA256_X86_64_PC_WINDOWS_MSVC="7a40439b06a33880487661b519f116a6a6d48b1c684bce79adfd5666875f23fd"
+SHA256_AARCH64_PC_WINDOWS_MSVC="6525ac801df272906f372502707f4a9812c440ace5549ddc7810570d4ca5aced"
 
 expected_sha_for() {
     case "$1" in
@@ -262,7 +262,7 @@ print_setup_instructions() {
         found_any=true
         success "[Codex] detected"
         echo ""
-        echo "codex mcp add fff -- fff-mcp"
+        echo "codex mcp add fff -- \"${binary_path}\""
         echo ""
     fi
 

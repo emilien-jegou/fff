@@ -7,21 +7,25 @@ use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
+use crate::git_recency;
 use crate::query_tracker::QueryTracker;
+use crate::rescan_stats::{RescanCounters, RescanReason, RescanStats};
+use crate::rescan_throttle::RescanThrottle;
 use crate::scan::ScanJob;
+use crate::watch::{WatchEvent, WatchId, WatchOptions, WatchRegistry};
 use git2::Repository;
 
-/// Poll `.git/index.lock` until it disappears (git write completed), giving up
+/// Poll `<git_dir>/index.lock` until it disappears (git write completed), giving up
 /// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
 /// to avoid reading a half-updated index when the watcher fires mid-`git add`.
 ///
 /// The wait is bounded and cheap: the lock file is typically cleared within
 /// a few milliseconds of the git command exiting.
-fn wait_for_git_index_lock_release(git_root: &Path) {
+fn wait_for_git_index_lock_release(git_dir: &Path) {
     const GIT_LOCK_POLL: Duration = Duration::from_millis(10);
     const GIT_LOCK_MAX_WAIT: Duration = Duration::from_millis(500);
 
-    let lock = git_root.join(".git").join("index.lock");
+    let lock = git_dir.join("index.lock");
     // Fast path: no lock present.
     if !lock.exists() {
         return;
@@ -73,12 +77,20 @@ pub struct SharedFilePicker(pub(crate) Arc<SharedPickerInner>);
 
 pub struct SharedPickerInner {
     picker: parking_lot::RwLock<Option<FilePicker>>,
+    /// Watch subscriptions live outside the picker lock so delivery and
+    /// (un)subscribing never contend with searches.
+    watchers: Arc<WatchRegistry>,
+    rescans: RescanCounters,
+    rescan_throttle: RescanThrottle,
 }
 
 impl Default for SharedPickerInner {
     fn default() -> Self {
         Self {
             picker: parking_lot::RwLock::new(None),
+            watchers: Arc::new(WatchRegistry::default()),
+            rescans: RescanCounters::default(),
+            rescan_throttle: RescanThrottle::default(),
         }
     }
 }
@@ -194,6 +206,39 @@ impl SharedFilePicker {
     /// Performs a safe async rescan. Guarantees only single active rescan per picker.
     /// If many rescans requested the last one guaranteed to be finished.
     pub fn trigger_full_rescan_async(&self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
+        self.trigger_full_rescan_with_reason(shared_frecency, RescanReason::Explicit)
+            .map(|_| ())
+    }
+
+    /// Returns admitted and throttled rescan requests by reason.
+    /// Counters start at picker creation or the last reset.
+    pub fn rescan_stats(&self) -> RescanStats {
+        self.0.rescans.snapshot()
+    }
+
+    pub fn reset_rescan_stats(&self) {
+        self.0.rescans.reset();
+    }
+
+    /// Returns `Ok(true)` when a rescan was started (or queued behind an
+    /// active scan) and `Ok(false)` when the request was throttled — the
+    /// caller must then fall back to incremental event processing.
+    pub(crate) fn trigger_full_rescan_with_reason(
+        &self,
+        shared_frecency: &SharedFrecency,
+        reason: RescanReason,
+    ) -> Result<bool, Error> {
+        // for giant folders we have no other choice other than throttling rescans
+        // if user is running application in millions of files with a ton of rescan events
+        // we drop / throttle some of requests to avoid constant burst of IO
+        if reason == RescanReason::Explicit {
+            self.0.rescan_throttle.note_explicit_scan();
+        } else if !self.check_rescan_throttle(reason) {
+            return Ok(false);
+        }
+
+        self.0.rescans.record(reason);
+
         match ScanJob::new_rescan(self, shared_frecency)? {
             Some(job) => {
                 job.spawn();
@@ -214,37 +259,136 @@ impl SharedFilePicker {
                 }
             }
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn check_rescan_throttle(&self, reason: RescanReason) -> bool {
+        let (live_files, has_git) = self
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|picker| (picker.live_file_count(), picker.has_git_repo()))
+            })
+            .unwrap_or((0, false));
+
+        if self.0.rescan_throttle.admit(live_files, has_git) {
+            return true;
+        }
+
+        self.0.rescans.record_throttled(reason);
+        tracing::debug!(%reason, live_files, "Rescan throttled, skipping");
+        false
+    }
+
+    /// Subscribe to filesystem changes matching `pattern`.
+    ///
+    /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
+    /// tree, or existing directories. An empty pattern watches the whole tree.
+    ///
+    /// Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
+    /// Gitignored and other ignored files are never triggering watcher.
+    pub fn watch(
+        &self,
+        pattern: &str,
+        options: WatchOptions,
+        callback: impl Fn(WatchId, &[WatchEvent]) + Send + Sync + 'static,
+    ) -> Result<WatchId, Error> {
+        let (base_path, has_watcher, watcher_ready) = {
+            let guard = self.read()?;
+            let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+
+            (
+                picker.base_path().to_path_buf(),
+                picker.has_watcher(),
+                picker.is_watcher_ready(),
+            )
+        };
+
+        if !has_watcher {
+            return Err(Error::WatcherDisabled);
+        }
+        if !watcher_ready {
+            return Err(Error::WatcherNotReady);
+        }
+
+        self.0
+            .watchers
+            .subscribe(&base_path, pattern, options, Box::new(callback))
+    }
+
+    /// Remove a watch subscription. Returns `true` if the id was active.
+    pub fn unwatch(&self, id: WatchId) -> bool {
+        self.0.watchers.unsubscribe(id)
+    }
+
+    /// Return whether a watch subscription is active.
+    pub fn is_watch_active(&self, id: WatchId) -> bool {
+        self.0.watchers.contains(id)
+    }
+
+    /// Remove every subscription without waiting for an executing callback.
+    pub fn shutdown_watches(&self) {
+        self.0.watchers.shutdown();
+    }
+
+    /// Remove every subscription and wait for an executing callback.
+    /// When called by that callback, it does not wait on itself.
+    pub fn shutdown_watches_and_wait(&self) {
+        self.0.watchers.shutdown_and_wait();
+    }
+
+    pub(crate) fn rebase_watches(&self, base_path: &Path) {
+        self.0.watchers.rebase(base_path);
+    }
+
+    pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
+        &self.0.watchers
     }
 
     /// Refresh git statuses for all indexed files
     #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
-        use tracing::debug;
-
-        let git_status = {
-            let git_root = {
-                let guard = self.read()?;
-                let Some(ref picker) = *guard else {
-                    return Err(Error::FilePickerMissing);
-                };
-                picker.git_root().map(|p| p.to_path_buf())
+        let (git_root, recency_config, base_path, picker_id) = {
+            // we do the libgit2 off lock cause it might take quite some time on very large repos
+            let guard = self.read()?;
+            let Some(ref picker) = *guard else {
+                return Err(Error::FilePickerMissing);
             };
-
-            debug!(?git_root, "Refreshing git status for picker");
-
-            if let Some(ref root) = git_root {
-                wait_for_git_index_lock_release(root);
-            }
-
-            GitStatusCache::read_git_status(
-                git_root.as_deref(),
-                &mut crate::git::default_status_options(),
+            (
+                picker.git_root().map(|p| p.to_path_buf()),
+                picker.git_recency_config(),
+                picker.base_path().to_path_buf(),
+                picker.trace_id().to_owned(),
             )
         };
 
+        let repo = git_root.as_deref().and_then(|root| {
+            let repo = Repository::open(root)
+                .inspect_err(|e| tracing::error!(?e, "Failed to open repo for git refresh"))
+                .ok()?;
+            wait_for_git_index_lock_release(repo.path());
+            Some(repo)
+        });
+
+        let git_status = repo.as_ref().and_then(|repo| {
+            GitStatusCache::read_status(repo, &mut crate::git::default_status_options())
+                .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
+                .ok()
+        });
+
+        let recency = repo
+            .as_ref()
+            .and_then(|repo| git_recency::compute_git_recency(repo, &recency_config, &base_path));
+
         let mut guard = self.write()?;
         let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+
+        // ensure consistency
+        if picker.trace_id() != picker_id {
+            return Ok(0);
+        }
 
         let statuses_count = if let Some(git_status) = git_status {
             let count = git_status.statuses_len();
@@ -253,6 +397,8 @@ impl SharedFilePicker {
         } else {
             0
         };
+
+        picker.apply_git_recency(recency.as_ref());
 
         Ok(statuses_count)
     }
@@ -278,9 +424,8 @@ impl SharedFilePicker {
             return Ok(());
         };
 
-        wait_for_git_index_lock_release(&git_root);
-
         let repo = Repository::open(&git_root)?;
+        wait_for_git_index_lock_release(repo.path());
         let status = GitStatusCache::git_status_for_paths(&repo, paths)?;
 
         let mut guard = self.write()?;
@@ -362,20 +507,31 @@ impl<T: LmdbStore> SharedDb<T> {
 
     /// Drop the in-memory tracker and delete the on-disk database directory.
     ///
-    /// Acquires the write lock, ensuring all readers (including any active mmap
-    /// access) are finished before the LMDB environment is closed and the files
-    /// are removed.
-    ///
     /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no tracker was initialized.
     pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
         let mut guard = self.write()?;
         let Some(tracker) = guard.take() else {
             return Ok(None);
         };
+
+        let closing_event = match tracker.shared_env().destroy() {
+            Ok(closing) => closing,
+            Err(e) => {
+                *guard = Some(tracker);
+                return Err(e);
+            }
+        };
+
         let db_path = tracker.env().path().to_path_buf();
         // Drop closes the LMDB env and unmaps the files
         drop(tracker);
         drop(guard);
+
+        // Deleting before mdb_env_close finishes would race the unmap.
+        if let Some(event) = closing_event {
+            event.wait_timeout(Duration::from_secs(5));
+        }
+
         std::fs::remove_dir_all(&db_path).map_err(|source| Error::RemoveDbDir {
             path: db_path.clone(),
             source,

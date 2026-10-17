@@ -1,6 +1,6 @@
 //! # FFF Search — High-performance file finder core
 //!
-//! This crate provides the core search engine for [FFF (Fast File Finder)](https://github.com/dmtrKovalenko/fff.nvim).
+//! This crate provides the core search engine for [FFF (Fast File Finder)](https://github.com/dmtrKovalenko/fff).
 //! It includes filesystem indexing with real-time watching, fuzzy matching powered
 //! by [frizbee](https://docs.rs/neo_frizbee), frecency scoring backed by LMDB,
 //! and multi-mode grep search.
@@ -20,6 +20,9 @@
 //! - [`grep`] — Live grep search supporting regex, plain-text, and fuzzy modes
 //!   with optional constraint filtering.
 //! - [`git`] — Git status caching and repository detection.
+//! - [`watch`] — Client-facing filesystem watch subscriptions: glob, exact
+//!   path, or directory subtree with normalized batch delivery
+//!   (see [`SharedFilePicker::watch`]).
 //!
 //! ## Shared State
 //!
@@ -116,11 +119,16 @@ pub use dbs::*;
 /// Git status caching and repository detection utilities.
 pub mod git;
 
+pub mod git_recency;
+pub use git_recency::GitRecencyConfig;
+
+mod definition;
+
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
 pub mod grep;
 pub use grep::*;
 
-/// Tracing/logging initialization and panic hook setup.
+/// Tracing/logging initialization
 pub mod log;
 
 /// Various path utils might be handy for you to work with fff paths
@@ -130,18 +138,24 @@ pub mod path_utils;
 pub mod types;
 pub use types::*;
 
+mod match_offsets;
+
 pub mod constants;
+
+/// Watcher rescan request accounting.
+pub mod rescan_stats;
+pub use rescan_stats::{RESCAN_STATS_ENABLED, RescanReason, RescanStats};
+
+mod rescan_throttle;
 
 // ==================================
 // these are public only for benchmarks, no backward compatibility guaranteed
 #[doc(hidden)]
-pub mod bigram_filter;
+pub use index::bigram_filter;
 #[doc(hidden)]
 pub mod simd_string_utils;
 // ==================================
 
-mod background_watcher;
-mod constraints;
 mod error;
 mod git_status_worker;
 mod ignore;
@@ -149,11 +163,17 @@ mod scan;
 mod score;
 mod sort_buffer;
 
-pub(crate) mod bigram_query;
+pub(crate) mod index;
 pub(crate) mod parallelism;
 pub(crate) mod simd_path;
 pub(crate) mod stable_vec;
 pub(crate) mod walk;
+
+/// Filesystem watch subscriptions with glob filtering and batched delivery,
+/// plus the background OS watcher.
+#[path = "watcher/mod.rs"]
+pub mod watch;
+pub use watch::{WatchEvent, WatchEventKind, WatchId, WatchOptions};
 
 // fff error
 pub use error::{Error, Result};

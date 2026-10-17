@@ -1,7 +1,10 @@
 [package]
 name = "fff-nvim"
-version = "0.9.6"
+version = "0.11.0"
 edition = "2024"
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -12,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 default = ["ripgrep"]
 ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep", "dep:ignore"]
 zlob = ["fff/zlob", "fff-query-parser/zlob", "dep:zlob"]
+# Keep full-rescan accounting in a release build; required by rescan_probe.
+rescan-stats = ["fff/rescan-stats"]
 
 [dependencies]
 # Workspace dependencies
@@ -19,10 +24,11 @@ ahash = { workspace = true }
 tracing = { workspace = true }
 
 # Local crates
-fff = { package = "fff-search", path = "../fff-core", version = "0.9.6", default-features = false, features = [
+fff = { package = "fff-search", path = "../fff-core", version = "0.11.0", default-features = false, features = [
 	"mimalloc-collect",
+	"definitions",
 ] }
-fff-query-parser = { path = "../fff-query-parser", version = "0.9.6", default-features = false }
+fff-query-parser = { path = "../fff-query-parser", version = "0.11.0", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 ctrlc = "3.4.2"
 git2 = { workspace = true }

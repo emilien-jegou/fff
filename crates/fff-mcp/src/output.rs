@@ -6,7 +6,7 @@ use fff::git::format_git_status_opt;
 use fff::grep::is_import_line;
 use fff::types::FileItem;
 
-use crate::cursor::CursorStore;
+use crate::cursor::{CursorStore, GrepCursor};
 
 fn frecency_word(score: i32) -> Option<&'static str> {
     if score >= 100 {
@@ -21,9 +21,11 @@ fn frecency_word(score: i32) -> Option<&'static str> {
 }
 
 pub fn file_suffix(git_status: Option<git2::Status>, frecency_score: i32) -> String {
+    // `clean` is the default state of nearly every file: annotating it burns
+    // context without adding signal. Only exceptional git state is surfaced.
     match (
         frecency_word(frecency_score),
-        format_git_status_opt(git_status),
+        format_git_status_opt(git_status).filter(|status| *status != "clean"),
     ) {
         (Some(f), Some(g)) => format!(" - {f} git:{g}"),
         (Some(f), None) => format!(" - {f}"),
@@ -153,7 +155,7 @@ pub struct GrepFormatter<'a> {
     pub matches: &'a [GrepMatch],
     pub files: &'a [&'a FileItem],
     pub total_matched: usize,
-    pub next_file_offset: usize,
+    pub cursor: GrepCursor,
     pub output_mode: OutputMode,
     pub max_results: usize,
     pub show_context: bool,
@@ -167,7 +169,7 @@ impl GrepFormatter<'_> {
             matches,
             files,
             total_matched,
-            next_file_offset,
+            cursor,
             output_mode,
             max_results,
             show_context,
@@ -185,7 +187,7 @@ impl GrepFormatter<'_> {
             return format_files_with_matches(
                 items,
                 files,
-                next_file_offset,
+                cursor,
                 auto_expand_defs,
                 cursor_store,
                 picker,
@@ -193,7 +195,7 @@ impl GrepFormatter<'_> {
         }
 
         if output_mode == OutputMode::Count {
-            return format_count(items, files, next_file_offset, cursor_store, picker);
+            return format_count(items, files, cursor, cursor_store, picker);
         }
 
         // output_mode == usage
@@ -363,8 +365,8 @@ impl GrepFormatter<'_> {
             shown_count += 1;
         }
 
-        if next_file_offset > 0 {
-            let cursor_id = cursor_store.store(next_file_offset);
+        if cursor.file_offset > 0 {
+            let cursor_id = cursor_store.store_grep(cursor);
             lines.push(format!("\ncursor: {}", cursor_id));
         }
 
@@ -375,7 +377,7 @@ impl GrepFormatter<'_> {
 fn format_files_with_matches(
     items: &[GrepMatch],
     files: &[&FileItem],
-    next_file_offset: usize,
+    cursor: GrepCursor,
     auto_expand_defs: bool,
     cursor_store: &mut CursorStore,
     picker: &FilePicker,
@@ -480,8 +482,8 @@ fn format_files_with_matches(
         }
     }
 
-    if next_file_offset > 0 {
-        let cursor_id = cursor_store.store(next_file_offset);
+    if cursor.file_offset > 0 {
+        let cursor_id = cursor_store.store_grep(cursor);
         lines.push(format!("\ncursor: {}", cursor_id));
     }
 
@@ -491,7 +493,7 @@ fn format_files_with_matches(
 fn format_count(
     items: &[GrepMatch],
     files: &[&FileItem],
-    next_file_offset: usize,
+    cursor: GrepCursor,
     cursor_store: &mut CursorStore,
     picker: &FilePicker,
 ) -> String {
@@ -511,8 +513,8 @@ fn format_count(
     for path in &order {
         lines.push(format!("{}: {}", path, counts[path.as_str()]));
     }
-    if next_file_offset > 0 {
-        let cursor_id = cursor_store.store(next_file_offset);
+    if cursor.file_offset > 0 {
+        let cursor_id = cursor_store.store_grep(cursor);
         lines.push(format!("\ncursor: {}", cursor_id));
     }
     lines.join("\n")
@@ -544,6 +546,27 @@ fn collect_file_preview<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_omits_clean_git_status() {
+        assert_eq!(file_suffix(None, 0), "");
+        assert_eq!(file_suffix(Some(git2::Status::CURRENT), 0), "");
+        assert_eq!(file_suffix(Some(git2::Status::empty()), 0), "");
+        assert_eq!(file_suffix(None, 120), " - hot");
+    }
+
+    #[test]
+    fn suffix_keeps_dirty_git_status() {
+        assert_eq!(
+            file_suffix(Some(git2::Status::WT_MODIFIED), 0),
+            " git:modified"
+        );
+        assert_eq!(file_suffix(Some(git2::Status::WT_NEW), 0), " git:untracked");
+        assert_eq!(
+            file_suffix(Some(git2::Status::INDEX_MODIFIED), 60),
+            " - warm git:staged_modified"
+        );
+    }
 
     #[test]
     fn trunc_strips_trailing_whitespace() {

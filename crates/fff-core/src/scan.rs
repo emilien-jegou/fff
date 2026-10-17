@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{error, info};
 
 use crate::FileSync;
-use crate::background_watcher::BackgroundWatcher;
-use crate::bigram_filter::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::error::Error;
 use crate::file_picker::FFFMode;
+use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
+use crate::watch::BackgroundWatcher;
 
 #[derive(Clone, Default)]
 pub(crate) struct ScanSignals {
@@ -161,14 +161,14 @@ impl ScanJob {
             trace_span: _,
         } = self;
 
-        let _scanning = ScanningGuard::new(&signals, config.install_watcher);
+        let _scanning = ScanningGuard::new(&signals);
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
-        let git_workdir = FileSync::discover_git_workdir(&base_path);
+        let git = FileSync::discover_git(&base_path);
         let sync = match FileSync::walk_filesystem(
             &base_path,
-            git_workdir.clone(),
+            git.clone(),
             &scanned_files_counter,
             &shared_frecency,
             mode,
@@ -205,7 +205,7 @@ impl ScanJob {
 
         // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
         // which is a real use case we need to have a way to start the git worker background thread dynamically
-        if git_workdir.is_some() && !signals.cancelled.load(Ordering::Acquire) {
+        if git.is_some() && !signals.cancelled.load(Ordering::Acquire) {
             git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
             git_status_worker.request_full_rescan(); // this runs anyway
         }
@@ -247,7 +247,7 @@ impl ScanJob {
 
             match BackgroundWatcher::new(
                 base_path.to_path_buf(),
-                git_workdir,
+                git,
                 shared_picker.clone(),
                 shared_frecency.clone(),
                 mode,
@@ -259,8 +259,11 @@ impl ScanJob {
                 Ok(watcher) => {
                     if let Ok(mut guard) = shared_picker.write()
                         && let Some(picker) = guard.as_mut()
+                        && picker.base_path() == base_path
+                        && !signals.cancelled.load(Ordering::Acquire)
                     {
                         picker.background_watcher = Some(watcher);
+                        signals.watcher_ready.store(true, Ordering::Release);
                     }
                 }
                 Err(e) => error!(?e, "failed to initialize background watcher"),
@@ -323,9 +326,11 @@ impl ScanJob {
 
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
+                && !signals.cancelled.load(Ordering::Acquire)
             {
                 picker.set_bigram_index(index);
             }
+            crate::index::release_thread_buffers();
 
             // Bigram only sniffs files <= MAX_INDEXABLE_FILE_SIZE; large
             // unknown-extension binaries slip past it and would otherwise be
@@ -355,30 +360,21 @@ impl ScanJob {
     }
 }
 
-/// RAII helper that flips the `scanning` signal on construction and
-/// resets it on drop (so early-returns can't leave it stuck on `true`).
-/// Also drives the `watcher_ready` signal on the initial-scan path.
+// Ensures early returns clear the scanning signal.
 struct ScanningGuard<'a> {
     signals: &'a ScanSignals,
-    release_watcher_ready_on_drop: bool,
 }
 
 impl<'a> ScanningGuard<'a> {
-    fn new(signals: &'a ScanSignals, release_watcher_ready_on_drop: bool) -> Self {
+    fn new(signals: &'a ScanSignals) -> Self {
         signals.scanning.store(true, Ordering::Relaxed);
-        Self {
-            signals,
-            release_watcher_ready_on_drop,
-        }
+        Self { signals }
     }
 }
 
 impl Drop for ScanningGuard<'_> {
     fn drop(&mut self) {
         self.signals.scanning.store(false, Ordering::Relaxed);
-        if self.release_watcher_ready_on_drop {
-            self.signals.watcher_ready.store(true, Ordering::Release);
-        }
     }
 }
 

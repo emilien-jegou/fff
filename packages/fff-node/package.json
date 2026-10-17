@@ -4,20 +4,26 @@
   "private": false,
   "description": "High-performance fuzzy file finder for Node.js - perfect for LLM agent tools",
   "type": "module",
-  "main": "dist/src/index.js",
-  "types": "dist/src/index.d.ts",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/src/index.js",
-      "types": "./dist/src/index.d.ts"
-    }
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
-    "test": "node test/e2e.mjs",
+    "build": "npm run build:bundle && npm run build:types",
+    "build:bundle": "tsup src/index.ts --format esm,cjs --platform node --target node18 --external ffi-rs --sourcemap",
+    "build:types": "tsc -p tsconfig.build.json",
+    "test": "node test/e2e.mjs && node test/watch.mjs",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
@@ -26,7 +32,9 @@
   "os": [
     "darwin",
     "linux",
-    "win32"
+    "win32",
+    "android",
+    "freebsd"
   ],
   "cpu": [
     "x64",
@@ -59,18 +67,9 @@
   "dependencies": {
     "ffi-rs": "^1.0.0"
   },
-  "optionalDependencies": {
-    "@ff-labs/fff-bin-darwin-arm64": "0.0.0",
-    "@ff-labs/fff-bin-darwin-x64": "0.0.0",
-    "@ff-labs/fff-bin-linux-x64-gnu": "0.0.0",
-    "@ff-labs/fff-bin-linux-arm64-gnu": "0.0.0",
-    "@ff-labs/fff-bin-linux-x64-musl": "0.0.0",
-    "@ff-labs/fff-bin-linux-arm64-musl": "0.0.0",
-    "@ff-labs/fff-bin-win32-x64": "0.0.0",
-    "@ff-labs/fff-bin-win32-arm64": "0.0.0"
-  },
   "devDependencies": {
     "typescript": "^5.0.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "tsup": "^8.5.0"
   }
 }

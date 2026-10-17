@@ -36,16 +36,23 @@
 
 import {
   close,
+  createPointer,
   DataType,
+  type FieldType,
+  freePointer,
+  funcConstructor,
   isNullPointer,
   type JsExternal,
   load,
   open,
+  PointerType,
   restorePointer,
+  unwrapPointer,
   wrapPointer,
 } from "ffi-rs";
 import { findBinary } from "./binary.js";
 import type {
+  DefinitionMode,
   DirItem,
   DirSearchResult,
   FileItem,
@@ -57,8 +64,10 @@ import type {
   Result,
   Score,
   SearchResult,
+  WatchEvent,
+  WatchEventKind,
 } from "./fff-api.js";
-import { createGrepCursor, err } from "./fff-api.js";
+import { createGrepCursor, definitionModeToInt, err } from "./fff-api.js";
 
 const LIBRARY_KEY = "fff_c";
 
@@ -188,7 +197,7 @@ function readCString(ptr: JsExternal): string | null {
  */
 function callRaw(
   funcName: string,
-  paramsType: DataType[],
+  paramsType: FieldType[],
   paramsValue: unknown[],
 ): { rawPtr: JsExternal; struct: FffResultRaw } {
   const rawPtr = load({
@@ -234,7 +243,7 @@ function freeResult(resultPtr: JsExternal): void {
  */
 function readResultEnvelope(
   funcName: string,
-  paramsType: DataType[],
+  paramsType: FieldType[],
   paramsValue: unknown[],
 ): { rawPtr: JsExternal; struct: FffResultRaw } | Result<never> {
   loadLibrary();
@@ -252,7 +261,7 @@ function readResultEnvelope(
 /** Call a function returning FffResult with void payload. */
 function callVoidResult(
   funcName: string,
-  paramsType: DataType[],
+  paramsType: FieldType[],
   paramsValue: unknown[],
 ): Result<void> {
   const res = readResultEnvelope(funcName, paramsType, paramsValue);
@@ -264,7 +273,7 @@ function callVoidResult(
 /** Call a function returning FffResult with int_value payload. */
 function callIntResult(
   funcName: string,
-  paramsType: DataType[],
+  paramsType: FieldType[],
   paramsValue: unknown[],
 ): Result<number> {
   const res = readResultEnvelope(funcName, paramsType, paramsValue);
@@ -277,7 +286,7 @@ function callIntResult(
 /** Call a function returning FffResult with bool in int_value. */
 function callBoolResult(
   funcName: string,
-  paramsType: DataType[],
+  paramsType: FieldType[],
   paramsValue: unknown[],
 ): Result<boolean> {
   const res = readResultEnvelope(funcName, paramsType, paramsValue);
@@ -290,7 +299,7 @@ function callBoolResult(
 /** Call a function returning FffResult with a C string in handle. */
 function callStringResult(
   funcName: string,
-  paramsType: DataType[],
+  paramsType: FieldType[],
   paramsValue: unknown[],
 ): Result<string | null> {
   const res = readResultEnvelope(funcName, paramsType, paramsValue);
@@ -306,7 +315,7 @@ function callStringResult(
 /** Call a function returning FffResult with a JSON string in handle. */
 function callJsonResult<T>(
   funcName: string,
-  paramsType: DataType[],
+  paramsType: FieldType[],
   paramsValue: unknown[],
 ): Result<T> {
   const res = readResultEnvelope(funcName, paramsType, paramsValue);
@@ -460,12 +469,8 @@ interface FffFileItemRaw {
 const FFF_SCORE_STRUCT = {
   total: DataType.I32,
   base_score: DataType.I32,
-  filename_bonus: DataType.I32,
-  special_filename_bonus: DataType.I32,
   frecency_boost: DataType.I32,
-  distance_penalty: DataType.I32,
   current_file_penalty: DataType.I32,
-  combo_match_boost: DataType.I32,
   exact_match: DataType.U8,
   match_type: DataType.External,
 };
@@ -473,12 +478,8 @@ const FFF_SCORE_STRUCT = {
 interface FffScoreRaw {
   total: number;
   base_score: number;
-  filename_bonus: number;
-  special_filename_bonus: number;
   frecency_boost: number;
-  distance_penalty: number;
   current_file_penalty: number;
-  combo_match_boost: number;
   exact_match: number;
   match_type: JsExternal;
 }
@@ -615,7 +616,7 @@ const FFF_GREP_MATCH_STRUCT = {
   match_ranges_count: DataType.U32,
   context_before_count: DataType.U32,
   context_after_count: DataType.U32,
-  fuzzy_score: DataType.U32, // actually u16 in C, but ffi-rs doesn't so we read it as u32 with padding
+  fuzzy_score: DataType.I16, // u16 in C; ffi-rs has no U16, so read I16 and mask (#888)
   has_fuzzy_score: DataType.U8,
   is_binary: DataType.U8,
   is_definition: DataType.U8,
@@ -699,12 +700,8 @@ function readScoreFromRaw(raw: FffScoreRaw): Score {
   return {
     total: raw.total,
     baseScore: raw.base_score,
-    filenameBonus: raw.filename_bonus,
-    specialFilenameBonus: raw.special_filename_bonus,
     frecencyBoost: raw.frecency_boost,
-    distancePenalty: raw.distance_penalty,
     currentFilePenalty: raw.current_file_penalty,
-    comboMatchBoost: raw.combo_match_boost,
     exactMatch: raw.exact_match !== 0,
     matchType: readCString(raw.match_type) ?? "",
   };
@@ -833,7 +830,7 @@ function readGrepMatchFromRaw(raw: FffGrepMatchRaw): GrepMatch {
   };
 
   if (raw.has_fuzzy_score !== 0) {
-    match.fuzzyScore = raw.fuzzy_score;
+    match.fuzzyScore = raw.fuzzy_score & 0xffff;
   }
   if (raw.context_before_count > 0) {
     match.contextBefore = readCStringArray(raw.context_before, raw.context_before_count);
@@ -1215,19 +1212,8 @@ export function ffiSearch(
       DataType.U32, // max_threads
       DataType.U32, // page_index
       DataType.U32, // page_size
-      DataType.I32, // combo_boost_multiplier
-      DataType.U32, // min_combo_count
     ],
-    paramsValue: [
-      handle,
-      query,
-      currentFile,
-      maxThreads,
-      pageIndex,
-      pageSize,
-      comboBoostMultiplier,
-      minComboCount,
-    ],
+    paramsValue: [handle, query, currentFile, maxThreads, pageIndex, pageSize],
     freeResultMemory: false,
   }) as JsExternal;
 
@@ -1325,19 +1311,8 @@ export function ffiSearchMixed(
       DataType.U32, // max_threads
       DataType.U32, // page_index
       DataType.U32, // page_size
-      DataType.I32, // combo_boost_multiplier
-      DataType.U32, // min_combo_count
     ],
-    paramsValue: [
-      handle,
-      query,
-      currentFile,
-      maxThreads,
-      pageIndex,
-      pageSize,
-      comboBoostMultiplier,
-      minComboCount,
-    ],
+    paramsValue: [handle, query, currentFile, maxThreads, pageIndex, pageSize],
     freeResultMemory: false,
   }) as JsExternal;
 
@@ -1357,15 +1332,19 @@ export function ffiLiveGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   loadLibrary();
 
   const rawPtr = load({
     library: LIBRARY_KEY,
-    funcName: "fff_live_grep",
+    funcName: "fff_live_grep_ex",
     retType: DataType.External,
     paramsType: [
       DataType.External, // handle
@@ -1377,9 +1356,10 @@ export function ffiLiveGrep(
       DataType.U32, // file_offset
       DataType.U32, // page_limit
       DataType.U64, // time_budget_ms
+      DataType.Boolean, // enforce_time_budget
       DataType.U32, // before_context
       DataType.U32, // after_context
-      DataType.Boolean, // classify_definitions
+      DataType.U8, // classify_definitions
     ],
     paramsValue: [
       handle,
@@ -1391,9 +1371,10 @@ export function ffiLiveGrep(
       fileOffset,
       pageLimit,
       timeBudgetMs,
+      enforceTimeBudget,
       beforeContext,
       afterContext,
-      classifyDefinitions,
+      definitionMode,
     ],
     freeResultMemory: false,
   }) as JsExternal;
@@ -1414,15 +1395,19 @@ export function ffiMultiGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   loadLibrary();
 
   const rawPtr = load({
     library: LIBRARY_KEY,
-    funcName: "fff_multi_grep",
+    funcName: "fff_multi_grep_ex",
     retType: DataType.External,
     paramsType: [
       DataType.External, // handle
@@ -1434,9 +1419,10 @@ export function ffiMultiGrep(
       DataType.U32, // file_offset
       DataType.U32, // page_limit
       DataType.U64, // time_budget_ms
+      DataType.Boolean, // enforce_time_budget
       DataType.U32, // before_context
       DataType.U32, // after_context
-      DataType.Boolean, // classify_definitions
+      DataType.U8, // classify_definitions
     ],
     paramsValue: [
       handle,
@@ -1448,9 +1434,10 @@ export function ffiMultiGrep(
       fileOffset,
       pageLimit,
       timeBudgetMs,
+      enforceTimeBudget,
       beforeContext,
       afterContext,
-      classifyDefinitions,
+      definitionMode,
     ],
     freeResultMemory: false,
   }) as JsExternal;
@@ -1599,6 +1586,232 @@ export function ffiGetHistoricalQuery(
     [DataType.External, DataType.U64],
     [handle, offset],
   );
+}
+
+// ALWAYS KEEP IN SYNC WITH fff.h
+//
+// Note: node uses `fff_watch_args` (flattened options) because ffi-rs cannot
+// marshal a `*const *const c_char` field inside a struct param — StringArray
+// is only supported as a top-level parameter.
+//
+// Batch contents are read through the C accessors (fff_watch_events_count /
+// fff_watch_events_get_path / fff_watch_events_get_kind /
+// fff_watch_events_get_from_path), so no struct layout knowledge lives on
+// this side.
+
+/** Map the C kind byte to the public WatchEventKind. */
+function watchKindFromU8(kind: number): WatchEventKind {
+  switch (kind) {
+    case 0:
+      return "created";
+    case 1:
+      return "modified";
+    case 2:
+      return "removed";
+    case 4:
+      return "renamed";
+    default:
+      return "rescan";
+  }
+}
+
+/** Trampoline signature: (watch id, batch address, user_data — unused). */
+const WATCH_TRAMPOLINE_TYPE = funcConstructor({
+  paramsType: [DataType.U64, DataType.U64, DataType.U64],
+  retType: DataType.Void,
+});
+
+/** JS handlers keyed by process-unique native watch id. */
+const watchHandlers = new Map<number, (events: WatchEvent[]) => void>();
+/** Instances (by handle identity) that ever created a watch subscription. */
+const watchInstances = new Set<unknown>();
+
+/** Lazily created process-wide trampoline (createPointer result). */
+let watchTrampoline: JsExternal[] | null = null;
+
+/** Convert a raw u64 address delivered through the trampoline to a JsExternal. */
+function addressToExternal(address: number): JsExternal {
+  return load({
+    library: LIBRARY_KEY,
+    funcName: "fff_ptr_offset",
+    retType: DataType.External,
+    paramsType: [DataType.U64, DataType.U64],
+    paramsValue: [address, 0],
+  }) as unknown as JsExternal;
+}
+
+/** Parse an FffWatchEventBatch at `address` and free the native memory. */
+function consumeWatchBatch(address: number): WatchEvent[] {
+  const batchPtr = addressToExternal(address);
+  const count = load({
+    library: LIBRARY_KEY,
+    funcName: "fff_watch_events_count",
+    retType: DataType.U32,
+    paramsType: [DataType.External],
+    paramsValue: [batchPtr],
+  }) as unknown as number;
+
+  const events: WatchEvent[] = [];
+  for (let i = 0; i < count; i++) {
+    const path = load({
+      library: LIBRARY_KEY,
+      funcName: "fff_watch_events_get_path",
+      retType: DataType.External,
+      paramsType: [DataType.External, DataType.U32],
+      paramsValue: [batchPtr, i],
+    }) as unknown as JsExternal;
+    const kind = load({
+      library: LIBRARY_KEY,
+      funcName: "fff_watch_events_get_kind",
+      retType: DataType.U8,
+      paramsType: [DataType.External, DataType.U32],
+      paramsValue: [batchPtr, i],
+    }) as unknown as number;
+    const event: WatchEvent = {
+      path: readCString(path) ?? "",
+      kind: watchKindFromU8(kind),
+    };
+    if (event.kind === "renamed") {
+      const from = load({
+        library: LIBRARY_KEY,
+        funcName: "fff_watch_events_get_from_path",
+        retType: DataType.External,
+        paramsType: [DataType.External, DataType.U32],
+        paramsValue: [batchPtr, i],
+      }) as unknown as JsExternal;
+      const decoded = readCString(from);
+      if (decoded) event.from = decoded;
+    }
+    events.push(event);
+  }
+
+  load({
+    library: LIBRARY_KEY,
+    funcName: "fff_free_watch_events",
+    retType: DataType.Void,
+    paramsType: [DataType.U64],
+    paramsValue: [address],
+  });
+
+  return events;
+}
+
+/**
+ * The single native->JS entry point for all watch subscriptions. Runs on
+ * the JS thread (threadsafe_function delivery); the batch is owned by us
+ * and freed inside `consumeWatchBatch`. Unknown watch ids (unsubscribe
+ * races) are benign: the batch is freed and dropped.
+ */
+function watchTrampolineImpl(
+  watchId: number,
+  batchAddress: number,
+  _userData: number,
+): void {
+  const events = consumeWatchBatch(batchAddress);
+  const handler = watchHandlers.get(Number(watchId));
+  if (handler === undefined || events.length === 0) return;
+  try {
+    handler(events);
+  } catch {
+    // User callback errors must not propagate into the FFI layer
+  }
+}
+
+function ensureWatchTrampoline(): JsExternal {
+  if (watchTrampoline === null) {
+    watchTrampoline = createPointer({
+      paramsType: [WATCH_TRAMPOLINE_TYPE],
+      paramsValue: [watchTrampolineImpl],
+    });
+  }
+  return unwrapPointer(watchTrampoline)[0] as JsExternal;
+}
+
+// fff watcher uses a single cross-boundary FFI callback to deliver all events which we then manually
+// mapping to the user's javascript functions
+function ensureWatchCallbackRegistered(handle: NativeHandle): Result<void> {
+  if (watchInstances.has(handle as unknown)) return { ok: true, value: undefined };
+  const trampoline = ensureWatchTrampoline();
+  const registered = callVoidResult(
+    "fff_set_watch_callback",
+    [DataType.External, DataType.External, DataType.U64],
+    [handle, trampoline, 0],
+  );
+  if (registered.ok) watchInstances.add(handle as unknown);
+  return registered;
+}
+
+function releaseWatchTrampolineIfIdle(): void {
+  if (watchHandlers.size > 0 || watchInstances.size > 0 || watchTrampoline === null)
+    return;
+  freePointer({
+    paramsType: [WATCH_TRAMPOLINE_TYPE],
+    paramsValue: watchTrampoline,
+    pointerType: PointerType.RsPointer,
+  });
+  watchTrampoline = null;
+}
+
+/**
+ * Create a push-mode watch subscription. `callback` receives a normalized
+ * batch of up to 128 events, delivered on the JS event loop.
+ *
+ * Returns the native watch id to pass to `ffiUnwatch`.
+ */
+export function ffiWatch(
+  handle: NativeHandle,
+  pattern: string,
+  ignore: string[],
+  callback: (events: WatchEvent[]) => void,
+): Result<number> {
+  loadLibrary();
+
+  const registered = ensureWatchCallbackRegistered(handle);
+  if (!registered.ok) return registered;
+
+  const created = callIntResult(
+    "fff_watch_args",
+    [DataType.External, DataType.String, DataType.StringArray, DataType.U32],
+    [handle, pattern, ignore, ignore.length],
+  );
+
+  if (!created.ok) return created;
+
+  // No startup race: threadsafe delivery lands on the JS event loop, so this
+  // synchronous set always precedes the first routing lookup for this id.
+  watchHandlers.set(created.value, callback);
+  return created;
+}
+
+/**
+ * Remove a watch subscription. Drops the JS handler synchronously — once
+ * this returns the callback can never run again (a late native tail batch
+ * misses the map lookup and is dropped).
+ */
+export function ffiUnwatch(handle: NativeHandle, watchId: number): Result<boolean> {
+  const result = callBoolResult(
+    "fff_unwatch",
+    [DataType.External, DataType.U64],
+    [handle, watchId],
+  );
+  watchHandlers.delete(watchId);
+  return result;
+}
+
+/**
+ * Post-`ffiDestroy` cleanup for an instance's watch state: drops any
+ * handlers that were never explicitly unwatched and releases the process
+ * trampoline when this was the last watching instance.
+ */
+export function ffiWatchCleanupAfterDestroy(
+  handle: NativeHandle,
+  watchIds: Iterable<number>,
+): void {
+  for (const id of watchIds) {
+    watchHandlers.delete(id);
+  }
+  watchInstances.delete(handle as unknown);
+  releaseWatchTrampolineIfIdle();
 }
 
 /**

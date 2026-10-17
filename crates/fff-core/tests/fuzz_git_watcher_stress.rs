@@ -773,7 +773,7 @@ fn read_truth_status(base: &Path) -> BTreeMap<String, Status> {
 
     let mut out = BTreeMap::new();
     for entry in statuses.iter() {
-        if let Some(p) = entry.path() {
+        if let Ok(p) = entry.path() {
             // git2 returns forward-slash paths; accept as-is.
             out.insert(p.to_string(), entry.status());
         }
@@ -953,13 +953,15 @@ fn grep_plain_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode: GrepMode::PlainText,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     };
@@ -990,13 +992,15 @@ fn grep_fuzzy_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode: GrepMode::Fuzzy,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     };
@@ -1022,13 +1026,15 @@ fn grep_regex_matches(shared: &SharedFilePicker, query: &str) -> Vec<String> {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
         smart_case: true,
+        casing: None,
         file_offset: 0,
         page_limit: 500,
         mode: GrepMode::Regex,
         time_budget_ms: 0,
+        enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     };
@@ -1258,7 +1264,7 @@ fn get_baseline_status_from_git(base: &Path) -> Vec<Live> {
         Err(_) => return out,
     };
     for entry in statuses.iter() {
-        if let Some(p) = entry.path() {
+        if let Ok(p) = entry.path() {
             let abs = base.join(p);
             // Must be a real file *right now* — ignore stale WT_DELETED rows.
             if abs.is_file() {

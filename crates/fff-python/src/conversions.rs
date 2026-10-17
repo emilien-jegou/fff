@@ -12,13 +12,8 @@ impl From<&fff::Score> for Score {
         Self {
             total: s.total,
             base_score: s.base_score,
-            filename_bonus: s.filename_bonus,
-            special_filename_bonus: s.special_filename_bonus,
             frecency_boost: s.frecency_boost,
-            distance_penalty: s.distance_penalty,
             current_file_penalty: s.current_file_penalty,
-            combo_match_boost: s.combo_match_boost,
-            path_alignment_bonus: s.path_alignment_bonus,
             exact_match: s.exact_match,
             match_type: s.match_type.to_string(),
         }

@@ -27,7 +27,10 @@ import {
   ffiSearchDirectories,
   ffiSearchMixed,
   ffiTrackQuery,
+  ffiUnwatch,
   ffiWaitForScan,
+  ffiWatch,
+  ffiWatchCleanupAfterDestroy,
   isAvailable,
   type NativeHandle,
 } from "./ffi.js";
@@ -47,6 +50,9 @@ import type {
   ScanProgress,
   SearchOptions,
   SearchResult,
+  WatchBatchCallback,
+  WatchOptions,
+  WatchUnsubscribe,
 } from "./fff-api.js";
 
 import { err } from "./fff-api.js";
@@ -86,6 +92,8 @@ import { err } from "./fff-api.js";
  */
 export class FileFinder implements FileFinderApi {
   private handle: NativeHandle | null;
+  /** Native ids of this instance's active watch subscriptions. */
+  private watchers = new Set<number>();
 
   private constructor(handle: NativeHandle) {
     this.handle = handle;
@@ -146,8 +154,15 @@ export class FileFinder implements FileFinderApi {
    */
   destroy(): void {
     if (this.handle !== null) {
-      ffiDestroy(this.handle);
+      const handle = this.handle;
+      ffiDestroy(handle);
       this.handle = null;
+      // ffiDestroy unsubscribes every watch (a delivery racing it is a
+      // benign id-map miss); dropping the remaining handlers afterwards is
+      // safe, and the process-wide trampoline is released when this was the
+      // last watching instance.
+      ffiWatchCleanupAfterDestroy(handle, this.watchers);
+      this.watchers.clear();
     }
   }
 
@@ -364,6 +379,7 @@ export class FileFinder implements FileFinderApi {
       options?.cursor?._offset ?? 0,
       options?.pageSize ?? 0,
       options?.timeBudgetMs ?? 0,
+      options?.enforceTimeBudget ?? false,
       options?.beforeContext ?? 0,
       options?.afterContext ?? 0,
       options?.classifyDefinitions ?? false,
@@ -413,6 +429,7 @@ export class FileFinder implements FileFinderApi {
       options.cursor?._offset ?? 0,
       options.pageSize ?? 0,
       options.timeBudgetMs ?? 0,
+      options.enforceTimeBudget ?? false,
       options.beforeContext ?? 0,
       options.afterContext ?? 0,
       options.classifyDefinitions ?? false,
@@ -580,6 +597,83 @@ export class FileFinder implements FileFinderApi {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;
     return ffiGetHistoricalQuery(guard.value, offset);
+  }
+
+  /**
+   * Subscribe to filesystem changes matching `pattern`.
+   *
+   * Pattern semantics:
+   * - Wildcards (`*.rs`, `src/**`, `./**\/*.ts`) — glob matched against the
+   *   base-path-relative path. Absolute globs must be under the base path.
+   * - No wildcards — resolved against the base path (must stay inside it):
+   *   an existing directory subscribes to its whole subtree, anything else
+   *   is an exact file path.
+   * - Omitted — subscribes to the entire indexed tree: `watch(callback)`.
+   *
+   * Push-based: events are delivered by the native watcher through a single
+   * process-wide callback trampoline (no polling, no idle wakeups). The
+   * callback receives normalized batches of up to 128 events on the JS event
+   * loop, with each path appearing at most once.
+   *
+   * Requires the instance to be created with watching enabled (default).
+   *
+   * @param pattern - Glob pattern, exact file path, or directory
+   * @param callback - Invoked with each batch of events
+   * @param options - Watch options
+   * @returns Unsubscribe handle; call it to stop
+   *
+   * @example
+   * ```typescript
+   * const sub = finder.watch("**\/*.rs", (events) => {
+   *   for (const e of events) console.log(e.kind, e.path);
+   * });
+   * if (sub.ok) sub.value(); // unsubscribe
+   *
+   * // no pattern: everything under the indexed base path
+   * const all = finder.watch((events) => console.log(events.length));
+   * ```
+   */
+  watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
+  watch(
+    pattern: string,
+    callback: WatchBatchCallback,
+    options?: WatchOptions,
+  ): Result<WatchUnsubscribe>;
+  watch(
+    patternOrCallback: string | WatchBatchCallback,
+    callbackOrOptions?: WatchBatchCallback | WatchOptions,
+    maybeOptions?: WatchOptions,
+  ): Result<WatchUnsubscribe> {
+    // Overload shift: watch(cb, opts?) -> empty pattern = whole tree.
+    const noPattern = typeof patternOrCallback === "function";
+    const pattern = noPattern ? "" : patternOrCallback;
+    const callback = noPattern
+      ? patternOrCallback
+      : (callbackOrOptions as WatchBatchCallback);
+    const options = noPattern
+      ? (callbackOrOptions as WatchOptions | undefined)
+      : maybeOptions;
+
+    if (typeof callback !== "function") {
+      return err("watch callback must be a function");
+    }
+
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+
+    const created = ffiWatch(guard.value, pattern, options?.ignore ?? [], callback);
+    if (!created.ok) return created;
+
+    const watchId = created.value;
+    this.watchers.add(watchId);
+
+    return {
+      ok: true,
+      value: () => {
+        if (!this.watchers.delete(watchId)) return;
+        if (this.handle !== null) ffiUnwatch(this.handle, watchId);
+      },
+    };
   }
 
   /**

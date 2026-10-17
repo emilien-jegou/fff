@@ -94,8 +94,6 @@ fn test_search_memory_pattern(
                         max_threads: 1 + (i % 4),
                         current_file: None,
                         project_path: None,
-                        combo_boost_score_multiplier: 100,
-                        min_combo_count: 3,
                         pagination: PaginationArgs {
                             offset: 0,
                             limit: 50 + (i % 50),

@@ -52,8 +52,8 @@ describe('fff.nvim core', function()
       wait_for_scan(10000)
 
       -- Search for "main" which should match main.lua and possibly other files
-      -- Args: query, max_threads, current_file, combo_boost_score_multiplier, min_combo_count, offset, page_size
-      local result = fff_rust.fuzzy_search_files('main', 2, nil, 100, 3, 0, 10)
+      -- Args: query, max_threads, current_file, offset, page_size
+      local result = fff_rust.fuzzy_search_files('main', 2, nil, 0, 10)
       assert.is_not_nil(result)
       assert.is_not_nil(result.items)
       assert.is_true(#result.items > 0, 'expected search results for "main"')

@@ -492,6 +492,18 @@ function M.setup_keymaps()
   set_keymap({ 'i', 'n' }, keymaps.toggle_select, P.toggle_select, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.send_to_quickfix, P.send_to_quickfix, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.cycle_grep_modes, P.cycle_grep_modes, input_opts)
+  -- last, so an explicitly configured key wins over the built-in bound to it
+  set_keymap('i', keymaps.clear_query, P.clear_query, input_opts)
+
+  if keymaps.insert_newline_escape then
+    -- Inserts the literal 2-char `\n` sequence which the grep engine
+    -- interprets as a multiline search boundary
+    local newline_escape_opts = vim.tbl_extend('force', input_opts, { expr = true, replace_keycodes = false })
+    set_keymap('i', keymaps.insert_newline_escape, function()
+      if S.mode ~= 'grep' then return '' end
+      return '\\n'
+    end, newline_escape_opts)
+  end
 
   local input_mouse_opts = vim.tbl_extend('force', input_opts, { expr = true, replace_keycodes = true })
   set_keymap(
@@ -553,6 +565,13 @@ function M.setup_keymaps()
     set_keymap('n', keymaps.toggle_debug, P.toggle_debug, preview_opts)
     set_keymap('n', keymaps.toggle_select, P.toggle_select, preview_opts)
     set_keymap('n', keymaps.send_to_quickfix, P.send_to_quickfix, preview_opts)
+  end
+
+  -- Applied last so a user mapping wins over the built-in on the same lhs.
+  for mode, maps in pairs(S.config.mappings or {}) do
+    for lhs, rhs in pairs(maps) do
+      set_keymap(mode, lhs, rhs, input_opts)
+    end
   end
 
   vim.api.nvim_buf_attach(S.input_buf, false, {

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from os import PathLike
 from typing import Any, Literal, TypeAlias
 
@@ -17,13 +17,8 @@ class FFFException(Exception):
 class Score:
     total: int
     base_score: int
-    filename_bonus: int
-    special_filename_bonus: int
     frecency_boost: int
-    distance_penalty: int
     current_file_penalty: int
-    combo_match_boost: int
-    path_alignment_bonus: int
     exact_match: bool
     match_type: str
     def __repr__(self) -> str: ...
@@ -145,6 +140,22 @@ class GrepCursor:
     def __init__(self, offset: int) -> None: ...
     def __repr__(self) -> str: ...
 
+class WatchEvent:
+    path: str
+    kind: Literal["created", "modified", "removed", "rescan", "renamed"]
+    from_path: str | None
+    def __repr__(self) -> str: ...
+
+class WatchSubscription:
+    @property
+    def id(self) -> int: ...
+    @property
+    def active(self) -> bool: ...
+    def unsubscribe(self) -> bool: ...
+    def __enter__(self) -> WatchSubscription: ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None: ...
+    def __repr__(self) -> str: ...
+
 class FileFinder:
     def __init__(
         self,
@@ -163,6 +174,7 @@ class FileFinder:
         cache_budget_max_file_size: int = 0,
         enable_fs_root_scanning: bool = False,
         enable_home_dir_scanning: bool = False,
+        follow_symlinks: bool = False,
     ) -> None: ...
     def __enter__(self) -> FileFinder: ...
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None: ...
@@ -182,8 +194,6 @@ class FileFinder:
         max_threads: int = 0,
         page_index: int = 0,
         page_size: int = 0,
-        combo_boost_score_multiplier: int = 0,
-        min_combo_count: int = 0,
     ) -> SearchResult: ...
     def glob(
         self,
@@ -211,8 +221,6 @@ class FileFinder:
         max_threads: int = 0,
         page_index: int = 0,
         page_size: int = 0,
-        combo_boost_score_multiplier: int = 0,
-        min_combo_count: int = 0,
     ) -> MixedSearchResult: ...
     def grep(
         self,
@@ -225,6 +233,7 @@ class FileFinder:
         cursor: GrepCursor | None = None,
         page_limit: int = 0,
         time_budget_ms: int = 0,
+        enforce_time_budget: bool = False,
         before_context: int = 0,
         after_context: int = 0,
         classify_definitions: bool = False,
@@ -241,6 +250,7 @@ class FileFinder:
         cursor: GrepCursor | None = None,
         page_limit: int = 0,
         time_budget_ms: int = 0,
+        enforce_time_budget: bool = False,
         before_context: int = 0,
         after_context: int = 0,
         classify_definitions: bool = False,
@@ -249,6 +259,13 @@ class FileFinder:
     def is_scanning(self) -> bool: ...
     async def wait_for_scan(self, timeout_ms: int = 5000) -> bool: ...
     def wait_for_scan_blocking(self, timeout_ms: int = 5000) -> bool: ...
+    def watch(
+        self,
+        pattern: str | None,
+        callback: Callable[[list[WatchEvent]], object],
+        *,
+        ignore: list[str] | None = None,
+    ) -> WatchSubscription: ...
     def reindex(self, new_path: _PathInput) -> None: ...
     def refresh_git_status(self) -> int: ...
     def track_query(self, query: str, selected_file_path: _PathInput) -> bool: ...

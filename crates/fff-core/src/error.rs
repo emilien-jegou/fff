@@ -34,6 +34,22 @@ pub enum Error {
         #[source]
         source: heed::Error,
     },
+    #[error(
+        "LMDB env at {path} is already open as the '{open_as}' database with different options; requested by '{requested_as}'. Use a distinct path per database."
+    )]
+    EnvSpecMismatch {
+        path: std::path::PathBuf,
+        open_as: &'static str,
+        requested_as: &'static str,
+    },
+    #[error(
+        "The {db} database at {path} is still used by {holders} other tracker(s) in this process"
+    )]
+    DbInUse {
+        db: &'static str,
+        path: std::path::PathBuf,
+        holders: usize,
+    },
     #[error("Failed to create {db} database: {source}")]
     DbCreate {
         db: &'static str,
@@ -94,6 +110,21 @@ pub enum Error {
 
     #[error("Filesystem walk failed: {0}")]
     WalkFailed(String),
+
+    #[error("Invalid glob pattern '{pattern}': {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
+
+    #[error("File system watching is disabled for this picker")]
+    WatcherDisabled,
+
+    #[error("File system watcher is not ready")]
+    WatcherNotReady,
+
+    #[error("Indexed base path changed while creating the watch subscription")]
+    WatchBaseChanged,
+
+    #[error("Failed to start watch callback dispatcher: {0}")]
+    WatchDispatcherStart(#[source] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

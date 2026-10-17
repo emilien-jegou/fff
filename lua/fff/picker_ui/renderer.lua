@@ -4,8 +4,6 @@ local rust = require('fff.rust')
 local list_separator = require('fff.list_separator')
 local scrollbar = require('fff.scrollbar')
 local list_renderer = require('fff.picker_ui.list_renderer')
-local combo_renderer = require('fff.picker_ui.combo_renderer')
-local file_picker = require('fff.file_picker')
 local layout = require('fff.layout')
 local picker_ui_state = require('fff.picker_ui.picker_ui_state')
 
@@ -92,7 +90,14 @@ local function render_grep_empty_state(ctx)
   local hl_cmds = {}
 
   table.insert(content, '')
-  table.insert(content, '  Start typing to search file contents...')
+  if S.pagination.grep_next_file_offset ~= 0 then
+    local direction = prompt_position == 'bottom' and 'up' or 'down'
+    table.insert(content, '  More files remain. Move ' .. direction .. ' to keep searching.')
+  elseif S.query and S.query ~= '' then
+    table.insert(content, '  No matches found.')
+  else
+    table.insert(content, '  Start typing to search file contents...')
+  end
   table.insert(content, '')
   table.insert(content, '  Tips:')
   table.insert(content, '    "pattern *.rs"    search only in Rust files')
@@ -131,7 +136,15 @@ local function render_grep_empty_state(ctx)
   for i = 0, #content - 1 do
     local line = content[i + 1]
     if
-      line and (line:match('^%s+Start typing') or line:match('^%s+Tips') or line:match('^%s+"') or line:match('^%s+!'))
+      line
+      and (
+        line:match('^%s+Start typing')
+        or line:match('^%s+More files remain')
+        or line:match('^%s+No matches found')
+        or line:match('^%s+Tips')
+        or line:match('^%s+"')
+        or line:match('^%s+!')
+      )
     then
       pcall(
         vim.api.nvim_buf_set_extmark,
@@ -167,27 +180,21 @@ local function build_render_context()
   local text_offset = win_info and win_info.textoff or 2
   local text_width = win_width - text_offset
 
-  local combo_boost_score_multiplier = config.history and config.history.combo_boost_score_multiplier or 100
   local separator = nil
-  local combo_info = nil
-  if S.mode ~= 'grep' and not S.suggestion_source then
-    combo_info = combo_renderer.detect(
-      items,
-      file_picker,
-      combo_boost_score_multiplier,
-      S.next_search_force_combo_boost or config.history.min_combo_count == 0
-    )
-  end
-  S.next_search_force_combo_boost = false
-
-  if combo_info and S.combo_visible then
-    separator = {
-      idx = combo_info.idx,
-      text = combo_info.text,
-      text_hl = config.hl.combo_header,
-      border_hl = config.hl.border,
-    }
-    S.combo_initial_cursor = combo_info.idx
+  if S.mode == 'grep' and not S.suggestion_source then
+    local definition_count = 0
+    for _, item in ipairs(items) do
+      if not item.is_definition then break end
+      definition_count = definition_count + 1
+    end
+    if definition_count > 0 and definition_count < #items then
+      separator = {
+        idx = definition_count,
+        text = 'Definitions',
+        text_hl = config.hl.combo_header,
+        border_hl = config.hl.border,
+      }
+    end
   end
 
   local display_start = 1
@@ -218,7 +225,6 @@ local function build_render_context()
     debug_enabled = config and config.debug and config.debug.show_scores,
     prompt_position = prompt_position,
     separator = separator,
-    combo_info = combo_info,
     display_start = display_start,
     display_end = display_end,
     iter_start = iter_start,
@@ -235,11 +241,12 @@ local function build_render_context()
 end
 
 local function finalize_render(separator_line, ctx)
-  if ctx.separator and separator_line then
+  local topline = vim.fn.getwininfo(S.list_win)[1].topline
+  if ctx.separator and separator_line and separator_line >= topline and separator_line < topline + ctx.win_height then
     local arrow = ctx.prompt_position == 'bottom' and '↓' or '↑'
 
     local list_cfg = vim.api.nvim_win_get_config(S.list_win)
-    local screen_row = list_cfg.row + separator_line
+    local screen_row = list_cfg.row + separator_line - topline + 1
 
     list_separator.update({
       list_win = S.list_win,
@@ -270,6 +277,7 @@ function M.render_list()
   end
 
   local item_to_lines, separator_line = list_renderer.render(ctx, S.list_buf, S.list_win, S.ns_id)
+  ctx.separator_line = separator_line
   S.item_to_lines = item_to_lines
   S.last_render_ctx = ctx
 
@@ -319,6 +327,7 @@ local function rerender_cursor_rows(old_cursor, new_cursor)
   end
 
   vim.api.nvim_win_set_cursor(S.list_win, { new_lines.last, 0 })
+  finalize_render(ctx.separator_line, ctx)
   return true
 end
 

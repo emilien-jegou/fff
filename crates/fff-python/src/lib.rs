@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 mod conversions;
 mod finder;
 mod types;
+mod watch;
 
 create_exception!(fff_python, FFFException, pyo3::exceptions::PyException);
 
@@ -39,6 +40,8 @@ fn _fff_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::GrepResult>()?;
     m.add_class::<types::ScanProgress>()?;
     m.add_class::<types::GrepCursor>()?;
+    m.add_class::<types::WatchEvent>()?;
+    m.add_class::<watch::WatchSubscription>()?;
     m.add("FFFException", m.py().get_type::<FFFException>())?;
     Ok(())
 }

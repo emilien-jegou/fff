@@ -29,6 +29,9 @@ local function get_border_chars(config)
   if border == nil or border == '' then border = vim.o.winborder end
   if border == nil or border == '' then border = 'single' end
 
+  if type(border) == 'table' then
+    if #border == 2 and type(border[1]) == 'table' and type(border[2]) == 'table' then return border[1], border[2] end
+  end
   if BORDER_PRESETS[border] then return BORDER_PRESETS[border], T_JUNCTION_PRESETS[border] end
   return BORDER_PRESETS.single, T_JUNCTION_PRESETS.single
 end
@@ -70,6 +73,11 @@ local function resolve_prompt_position(config)
 end
 
 M.resolve_prompt_position = resolve_prompt_position
+
+function M.resolve_title_pos(value)
+  if utils.is_one_of(value, { 'left', 'center', 'right' }) then return value end
+  return 'left'
+end
 
 local function resolve_preview_position(config)
   if config and config.layout and config.layout.preview_position then
@@ -252,6 +260,8 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
   local border_chars, t_junctions = get_border_chars(config)
   local has_preview = layout.preview ~= nil
   local title = ' ' .. (config.title or 'FFFiles') .. ' '
+  local title_pos = M.resolve_title_pos(config.layout.title_position)
+  local filename_pos = M.resolve_title_pos(config.layout.filename_position)
 
   local list_neighbour_input_top = prompt_position == 'top'
   local list_neighbour_input_bottom = prompt_position == 'bottom'
@@ -311,7 +321,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
   }
   if prompt_position == 'bottom' then
     list_cfg.title = title
-    list_cfg.title_pos = 'left'
+    list_cfg.title_pos = title_pos
   end
 
   local input_neighbour_preview_left = has_preview and preview_position == 'left'
@@ -378,7 +388,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
   }
   if prompt_position == 'top' then
     input_cfg.title = title
-    input_cfg.title_pos = 'left'
+    input_cfg.title_pos = title_pos
   end
 
   local preview_cfg = nil
@@ -421,7 +431,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
       border = preview_border,
       -- Title hidden when file_info renders above — its footer already says "Preview".
       title = layout.file_info and '' or ' Preview ',
-      title_pos = 'left',
+      title_pos = filename_pos,
       zindex = 51,
     }
   end
@@ -446,7 +456,7 @@ local function build_window_configs(layout, config, prompt_position, preview_pos
       style = 'minimal',
       border = fi_border,
       title = ' File Info ',
-      title_pos = 'left',
+      title_pos = filename_pos,
       -- Above the list/preview zindex so its borders win the shared rows.
       zindex = 53,
     }

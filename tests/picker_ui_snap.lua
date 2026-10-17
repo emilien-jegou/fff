@@ -28,6 +28,7 @@ local function setup(geometry, opts)
   child.o.columns = geometry.cols
 
   local debug_enabled = opts.debug == true
+  local show_path_first = opts.show_path_first == true
   -- Default show_file_info hides timings: Modified/Accessed timestamps drift
   -- between runs and would otherwise force `ignore_text` on those rows. Tests
   -- can override (or restore) by passing `opts.show_file_info`.
@@ -48,6 +49,9 @@ local function setup(geometry, opts)
           prompt = '> ',
           frecency = { enabled = true, db_path = %q },
           history  = { enabled = true, db_path = %q },
+          layout = {
+            show_path_first = %s,
+          },
           logging  = { enabled = false },
           debug    = {
             enabled = %s,
@@ -63,6 +67,7 @@ local function setup(geometry, opts)
       geometry.winborder or '',
       fixture.frecency_db,
       fixture.history_db,
+      tostring(show_path_first),
       tostring(debug_enabled),
       tostring(debug_enabled),
       vim.inspect(show_file_info)
@@ -85,10 +90,9 @@ local function assert_snapshot_match(opts)
   })
 end
 
-local function open_picker(prompt_position, query)
-  child.lua(
-    string.format('require("fff.picker_ui.picker_ui").open({ layout = { prompt_position = %q } })', prompt_position)
-  )
+local function open_picker(prompt_position, query, layout_opts)
+  local layout = vim.tbl_extend('force', { prompt_position = prompt_position }, layout_opts or {})
+  child.lua(string.format('require("fff.picker_ui.picker_ui").open({ layout = %s })', vim.inspect(layout)))
   vim.loop.sleep(400)
 
   if query and query ~= '' then
@@ -184,6 +188,65 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
 end
 T['debug_wide'] = debug_wide_set
 
+T['show_path_first'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup(LAYOUTS[3], { show_path_first = true }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['show_path_first']['query_main_' .. prompt] = function()
+    open_picker(prompt, 'main')
+    assert_snapshot_match()
+  end
+end
+
+T['title_center_no_count'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['title_center_no_count']['empty_' .. prompt] = function()
+    open_picker(prompt, nil, { title_position = 'center', show_file_count = false })
+    assert_snapshot_match()
+  end
+end
+
+T['filename_center'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['filename_center']['empty_' .. prompt] = function()
+    open_picker(prompt, nil, { filename_position = 'center' })
+    assert_snapshot_match()
+  end
+end
+
+-- Non-default position on a non-default file: title is re-set on cursor move.
+T['filename_right'] = MiniTest.new_set({
+  hooks = {
+    pre_case = function() setup({ cols = 140, rows = 32 }) end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  T['filename_right']['cursor_second_item_' .. prompt] = function()
+    open_picker(prompt, nil, { filename_position = 'right' })
+    child.type_keys(prompt == 'bottom' and '<Up>' or '<Down>')
+    vim.loop.sleep(200)
+    assert_snapshot_match()
+  end
+end
+
 T['combo'] = MiniTest.new_set({
   hooks = {
     pre_case = function() setup({ cols = 140, rows = 32 }) end,
@@ -193,7 +256,7 @@ T['combo'] = MiniTest.new_set({
 
 local function train_combo()
   -- Train: "main" → src/main.rs four times so open_count crosses the default
-  -- min_combo_count (3). track_query_completion is async; pause between calls
+  -- track_query_completion is async; pause between calls
   -- + final settle for the lmdb writer.
   for _ = 1, 4 do
     child.lua(
