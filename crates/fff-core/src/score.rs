@@ -514,9 +514,6 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     );
 
     let main_needle = valid_parts[0].as_bytes();
-    let main_needle_len = main_needle.len() as u16;
-
-    let mut dirname_buf = String::with_capacity(32);
 
     let results: Vec<(&DirItem, Score)> = path_matches
         .into_iter()
@@ -620,7 +617,7 @@ fn match_and_score_in_arena<'a>(
     context: &ScoringContext,
     arena: ArenaPtr,
 ) -> Vec<(&'a FileItem, Score)> {
-    match_and_score_in_arena_inner(files, context, arena)
+    match_and_score_in_arena_inner::<false>(files, context, arena)
 }
 
 fn classify_match_type(query: &str, relative_path: &str) -> MatchType {
@@ -726,7 +723,7 @@ fn match_and_score_in_arena_inner<'a, const WITH_CURRENT_FILE: bool>(
 
     let query_text = fuzzy_parts[0];
 
-    let score_match = |(match_idx, path_match): (usize, &neo_frizbee::Match)| {
+    let score_match = |(_match_idx, path_match): (usize, &neo_frizbee::Match)| {
         let file_idx = path_match.index as usize;
         let file = working_files.index(file_idx);
 
@@ -836,7 +833,7 @@ fn calculate_current_file_penalty(
 /// Always returns results in descending order (best scores first).
 /// The UI layer handles rendering order based on prompt position.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-fn sort_and_paginate<'a, S>(
+fn sort_and_paginate<'a, S: ScoreLike>(
     mut results: Vec<(&'a FileItem, S)>,
     context: &ScoringContext,
     total: impl Fn(&S) -> i32,

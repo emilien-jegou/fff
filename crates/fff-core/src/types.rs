@@ -917,8 +917,9 @@ impl Constrainable for FileItem {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum MatchType {
+    #[default]
     Partial = 0,
     Full = 1,
     Case = 2,

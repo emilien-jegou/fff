@@ -187,4 +187,178 @@ pub(super) fn fuzzy_grep_search<'a>(
                         for &ch in &unique_needle_chars {
                             if memchr::memchr(ch, file_bytes).is_some() {
                                 chars_found += 1;
-... (+183 lines) [see remaining: rtk proxy git show 'pr-1:crates/fff-core/src/grep/fuzzy_grep.rs' | tail -n +190]
+                                if chars_found >= min_chars_required {
+                                    break;
+                                }
+                            }
+                        }
+                        if chars_found < min_chars_required {
+                            return None;
+                        }
+                    }
+
+                    // Validate the whole file as UTF-8 once upfront. Source code
+                    // files are virtually always valid UTF-8; this single check
+                    // replaces per-line from_utf8 calls (~8% of fuzzy grep time)
+                    let file_is_utf8 = std::str::from_utf8(file_bytes).is_ok();
+
+                    let mut stepper = LineStep::new(b'\n', 0, file_bytes.len());
+                    let estimated_lines = (file_bytes.len() / 40).max(64);
+                    let mut file_lines: Vec<&str> = Vec::with_capacity(estimated_lines);
+                    let mut line_meta: Vec<(u64, u64)> = Vec::with_capacity(estimated_lines);
+
+                    let mut line_number: u64 = 1;
+                    while let Some(line_match) = stepper.next_match(file_bytes) {
+                        let byte_offset = line_match.start() as u64;
+                        let trimmed = strip_line_terminators(&file_bytes[line_match]);
+
+                        if !trimmed.is_empty() {
+                            // we know for sure that the file is UTF-8 at this point
+                            let line_str = if file_is_utf8 {
+                                unsafe { std::str::from_utf8_unchecked(trimmed) }
+                            } else if let Ok(s) = std::str::from_utf8(trimmed) {
+                                s
+                            } else {
+                                line_number += 1;
+                                continue;
+                            };
+                            file_lines.push(line_str);
+                            line_meta.push((line_number, byte_offset));
+                        }
+
+                        line_number += 1;
+                    }
+
+                    if file_lines.is_empty() {
+                        return None;
+                    }
+
+                    // Single-pass: score + indices in one Smith-Waterman run per line (not parallel)
+                    let matches_with_indices = matcher.match_list_indices(&file_lines);
+                    let mut file_matches: Vec<GrepMatch> = Vec::new();
+
+                    for mut match_indices in matches_with_indices {
+                        if match_indices.score < min_score {
+                            continue;
+                        }
+
+                        let idx = match_indices.index as usize;
+                        let raw_line = file_lines[idx];
+
+                        let truncated = truncate_display_bytes(raw_line.as_bytes());
+                        let display_line = if truncated.len() < raw_line.len() {
+                            // SAFETY: truncate_display_bytes preserves UTF-8 char boundaries
+                            &raw_line[..truncated.len()]
+                        } else {
+                            raw_line
+                        };
+
+                        // If the line was truncated, re-compute indices on the shorter string.
+                        if display_line.len() < raw_line.len() {
+                            let Some(re_indices) = matcher
+                                .match_list_indices(&[display_line])
+                                .into_iter()
+                                .next()
+                            else {
+                                continue;
+                            };
+                            match_indices = re_indices;
+                        }
+
+                        match_indices.indices.sort_unstable();
+
+                        // Minimum matched chars: at least (needle_len - max_typos)
+                        // characters must appear. This is consistent with the typo
+                        // budget: each typo can drop one needle char from the alignment.
+                        let min_matched = needle_len.saturating_sub(max_typos).max(1);
+                        if match_indices.indices.len() < min_matched {
+                            continue;
+                        }
+
+                        let indices = &match_indices.indices;
+
+                        if let (Some(&first), Some(&last)) = (indices.first(), indices.last()) {
+                            // reject widely scattered matches
+                            let span = (last - first + 1) as usize;
+                            if span > max_match_span {
+                                continue;
+                            }
+
+                            // Density check: matched chars / span must be dense enough.
+                            // Relaxed for perfect subsequence matches (all needle chars
+                            // present), slightly relaxed for typo matches to handle
+                            // delimiter-heavy targets
+                            // (e.g. "ff_flv_encode_picture_header" has span inflated by underscores w/ density ~68%)
+                            let density = (indices.len() * 100) / span;
+                            let min_density = if indices.len() >= needle_len {
+                                45 // Perfect subsequence relaxed (delimiters inflate span)
+                            } else {
+                                65 // Has typos filter out a long string
+                            };
+                            if density < min_density {
+                                continue;
+                            }
+
+                            // Gap count check: count discontinuities in the indices
+                            let gap_count = indices.windows(2).filter(|w| w[1] != w[0] + 1).count();
+                            if gap_count > max_gaps {
+                                continue;
+                            }
+                        }
+
+                        let (ln, bo) = line_meta[idx];
+                        let match_byte_offsets =
+                            char_indices_to_byte_offsets(display_line, &match_indices.indices);
+                        let col = match_byte_offsets
+                            .first()
+                            .map(|r| r.0 as usize)
+                            .unwrap_or(0);
+
+                        file_matches.push(GrepMatch {
+                            file_index: 0,
+                            line_number: ln,
+                            col,
+                            byte_offset: bo,
+                            line_content: display_line.to_string(),
+                            match_byte_offsets,
+                            fuzzy_score: Some(match_indices.score),
+                            match_type: MatchType::Partial,
+                            context_before: Vec::new(),
+                            context_after: Vec::new(),
+                        });
+
+                        if max_matches_per_file != 0 && file_matches.len() >= max_matches_per_file {
+                            break;
+                        }
+                    }
+
+                    if file_matches.is_empty() {
+                        return None;
+                    }
+
+                    Some((idx, *file, file_matches))
+                },
+            )
+            .flatten()
+            .collect();
+
+        for result in chunk_results {
+            running_matches += result.2.len();
+            per_file_results.push(result);
+        }
+
+        if running_matches >= page_limit || first_skipped.load(Ordering::Relaxed) != usize::MAX {
+            break;
+        }
+    }
+
+    let abort_resume = Some(first_skipped.load(Ordering::Relaxed)).filter(|&i| i != usize::MAX);
+    GrepResult::collect(
+        per_file_results,
+        files_to_search.len(),
+        options,
+        total_files,
+        filtered_file_count,
+        abort_resume,
+    )
+}
